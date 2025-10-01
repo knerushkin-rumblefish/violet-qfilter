@@ -499,14 +499,15 @@ impl<'a> Iterator for RunBlocksIter<'a> {
             ]
             .concat()
         };
-        self.q_bucket_idx += 1;
+        let current_q_bucket_idx = self.q_bucket_idx;
+        self.q_bucket_idx = current_q_bucket_idx + 1;
         while !self.filter.is_occupied(self.q_bucket_idx) {
             self.q_bucket_idx += 1;
         }
 
         Some(Run {
             buffer: blocks,
-            q_bucket_idx: self.q_bucket_idx,
+            q_bucket_idx: current_q_bucket_idx,
             start_idx: run_start_idx,
             end_idx: run_end_idx,
             rbits: self.filter.rbits,
