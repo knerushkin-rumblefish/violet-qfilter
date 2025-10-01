@@ -12,7 +12,7 @@ readme = "README.md"
 exclude = ["fuzz", "benches"]
 
 [features]
-default = []
+default = ["serde"]
 # Enable to support running on x64 cpus released before 2008
 legacy_x86_64_support = []
 jsonschema = ["schemars"]
@@ -23,6 +23,8 @@ xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 serde = { optional = true, version = "1", features = ["derive"] }
 serde_bytes = { optional = true, version = "0.11" }
 schemars = { optional = true, version = "0.8" }
+sha2 = "0.10.9"
+rand = "0.9.2"
 
 [dev-dependencies]
 serde_cbor = "0.11"

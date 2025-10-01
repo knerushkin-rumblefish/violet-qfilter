@@ -352,6 +352,100 @@ impl<'a> Iterator for BlockIter<'a> {
         }
     }
 }
+
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Run {
+    pub buffer: Vec<u8>,
+    pub q_bucket_idx: u64,
+    pub start_idx: u64,
+    pub end_idx: u64,
+
+    #[cfg_attr(feature = "serde", serde(rename = "q"))]
+    pub qbits: NonZeroU8,
+    #[cfg_attr(feature = "serde", serde(rename = "r"))]
+    pub rbits: NonZeroU8,
+}
+
+impl Run {
+    #[inline]
+    pub fn block_byte_size(&self) -> usize {
+        1 + 8 + 8 + 64 * self.rbits.usize() / 8
+    }
+
+    #[inline]
+    fn hash<T: Hash>(&self, item: T) -> u64 {
+        let mut hasher = StableHasher::new();
+        item.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn contains<T: Hash>(&self, item: T) -> bool {
+        let hash = self.hash(item);
+        let blocks_count = self.buffer.len() / self.block_byte_size();
+
+        let mut is_contains = false;
+        for block_num in 0..blocks_count {
+            let block_start_bit = block_num * self.block_byte_size();
+
+            let block_start = if block_num > 0 { block_start_bit } else { 0 };
+            let block_end = block_start + self.block_byte_size();
+            let block_bytes = &self.buffer[block_start..block_end];
+
+            let reminders = &block_bytes[1 + 8 + 8..][..8 * self.rbits.usize()];
+
+            let mut run_start_intra_block_idx = 0;
+            let mut run_end_intra_block_idx = 63;
+            // single block
+            if block_num == 0 && blocks_count == 1 {
+                run_start_intra_block_idx = self.start_idx % 64;
+                run_end_intra_block_idx = self.end_idx % 64;
+                // first block in block sequence
+            } else if block_num == 0 {
+                run_start_intra_block_idx = self.start_idx % 64;
+            // last block in block sequence
+            } else if block_num == blocks_count - 1 {
+                run_end_intra_block_idx = self.end_idx % 64;
+            }
+            for bucket_idx in run_start_intra_block_idx..=run_end_intra_block_idx {
+                let bucket_start_bit = bucket_idx * self.rbits.u64();
+                let bucket_end_bit = bucket_start_bit + self.rbits.u64();
+
+                let start_u64 = (bucket_start_bit / 64) as usize;
+                let num_rem_parts = 1 + (bucket_end_bit > ((start_u64 + 1) * 64) as u64) as usize;
+
+                let extra_low = bucket_start_bit as usize - start_u64 * 64;
+                let extra_high = ((start_u64 + 1) * 64).saturating_sub(bucket_end_bit as usize);
+
+                let rem_parts_bytes = &reminders[start_u64 * 8..][..num_rem_parts * 8];
+                let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
+                let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
+
+                if let Some(rem_part) = rem_parts_bytes.get(8..16) {
+                    let remaining_bits = bucket_end_bit - ((start_u64 + 1) * 64) as u64;
+                    let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
+                    remainder |= (rem_part & !(u64::MAX << remaining_bits))
+                        << (self.rbits.u64() - remaining_bits);
+                }
+
+                let current_quotient = self.q_bucket_idx;
+                let expected_quotient =
+                    (hash >> self.rbits.usize()) & ((1 << self.qbits.usize()) - 1);
+
+                let current_remainder = remainder;
+                let expected_remainder = hash & ((1 << self.rbits.usize()) - 1);
+
+                if expected_remainder == current_remainder && expected_quotient == current_quotient
+                {
+                    is_contains = true;
+                }
+            }
+        }
+
+        is_contains
+    }
+}
+
 pub struct RunBlocksIter<'a> {
     filter: &'a Filter,
     q_bucket_idx: u64,
@@ -377,7 +471,7 @@ impl<'a> RunBlocksIter<'a> {
 }
 
 impl<'a> Iterator for RunBlocksIter<'a> {
-    type Item = (u64, u64, u64, Vec<u8>);
+    type Item = Run;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(r) = self.remaining.checked_sub(1) {
@@ -396,27 +490,28 @@ impl<'a> Iterator for RunBlocksIter<'a> {
         let run_end_block_idx =
             ((run_end_block + 1) * self.filter.block_byte_size() as u64) as usize;
 
-        let blocks: Vec<u8>;
-        if run_end_block_idx > run_start_block_idx {
-            blocks = self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec();
+        let blocks = if run_end_block_idx > run_start_block_idx {
+            self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec()
         } else {
-            blocks = [
+            [
                 &self.filter.buffer[run_start_block_idx..],
                 &self.filter.buffer[..run_end_block_idx],
             ]
             .concat()
-            .into_iter()
-            .collect();
-        }
-
-        let run_blocks_desc = (self.q_bucket_idx, run_start_idx, run_end_idx, blocks);
-
+        };
         self.q_bucket_idx += 1;
         while !self.filter.is_occupied(self.q_bucket_idx) {
             self.q_bucket_idx += 1;
         }
 
-        Some(run_blocks_desc)
+        Some(Run {
+            buffer: blocks,
+            q_bucket_idx: self.q_bucket_idx,
+            start_idx: run_start_idx,
+            end_idx: run_end_idx,
+            rbits: self.filter.rbits,
+            qbits: self.filter.qbits,
+        })
     }
 }
 
@@ -1206,9 +1301,8 @@ impl Filter {
     }
 
     /// Returns whether item is present (probabilistically) in the filter.
-    pub fn contains(&self, item: u64) -> bool {
-        self.contains_fingerprint(item)
-        // self.contains_fingerprint(self.hash(item))
+    pub fn contains<T: Hash>(&self, item: T) -> bool {
+        self.contains_fingerprint(self.hash(item))
     }
 
     /// Returns whether the fingerprint is present (probabilistically) in the filter.
@@ -1230,9 +1324,8 @@ impl Filter {
     }
 
     /// Returns the number of times the item appears (probabilistically) in the filter.
-    pub fn count(&mut self, item: u64) -> u64 {
-        // self.count_fingerprint(self.hash(item))
-        self.count_fingerprint(item)
+    pub fn count<T: Hash>(&self, item: T) -> bool {
+        self.contains_fingerprint(self.hash(item))
     }
 
     /// Returns the amount of times the fingerprint appears (probabilistically) in the filter.
@@ -1374,7 +1467,7 @@ impl Filter {
     ///
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     #[inline]
-    pub fn insert_duplicated(&mut self, item: u64) -> Result<(), Error> {
+    pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
         self.insert_counting(u64::MAX, item).map(|_| ())
     }
 
@@ -1386,7 +1479,7 @@ impl Filter {
     /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     #[inline]
-    pub fn insert(&mut self, item: u64) -> Result<bool, Error> {
+    pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
         self.insert_counting(1, item).map(|count| count == 0)
     }
 
@@ -1397,9 +1490,8 @@ impl Filter {
     /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
     /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
-    pub fn insert_counting(&mut self, max_count: u64, item: u64) -> Result<u64, Error> {
-        // let hash = self.hash(item);
-        let hash = item;
+    pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error> {
+        let hash = self.hash(item);
         match self.insert_impl(max_count, hash) {
             Ok(count) => Ok(count),
             Err(_) => {
@@ -1639,10 +1731,18 @@ impl Filter {
         hasher.finish()
     }
 
+    #[inline]
+    pub fn calc_item_qr<T: Hash>(&self, item: T) -> (u64, u64) {
+        let hash = self.hash(item);
+        let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
+        let remainder = hash & ((1 << self.rbits.get()) - 1);
+        (hash_bucket_idx, remainder)
+    }
+
     // This function simple return bucket idx, and remainder part
     // But where we decide how much bits to use fo those parts?
     #[inline]
-    pub fn calc_qr(&self, hash: u64) -> (u64, u64) {
+    fn calc_qr(&self, hash: u64) -> (u64, u64) {
         let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
         let remainder = hash & ((1 << self.rbits.get()) - 1);
         (hash_bucket_idx, remainder)
