@@ -61,6 +61,8 @@ use std::{
     ops::{RangeBounds, RangeFrom},
 };
 
+pub mod merkle;
+
 #[cfg(feature = "jsonschema")]
 use schemars::JsonSchema;
 #[cfg(feature = "serde")]
@@ -68,7 +70,6 @@ use serde::{Deserialize, Serialize};
 use stable_hasher::StableHasher;
 
 mod stable_hasher;
-
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
 ///
 /// This data structure is similar to a hash table that stores fingerprints in a very compact way.
@@ -96,9 +97,9 @@ pub struct Filter {
     #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
     #[cfg_attr(feature = "serde", serde(rename = "q"))]
-    qbits: NonZeroU8,
+    pub qbits: NonZeroU8,
     #[cfg_attr(feature = "serde", serde(rename = "r"))]
-    rbits: NonZeroU8,
+    pub rbits: NonZeroU8,
     #[cfg_attr(
         feature = "serde",
         serde(rename = "g", skip_serializing_if = "Option::is_none", default)
@@ -322,6 +323,197 @@ impl CastNonZeroU8 for NonZeroU8 {
     #[inline]
     fn usize(&self) -> usize {
         self.get() as usize
+    }
+}
+struct BlockIter<'a> {
+    filter: &'a Filter,
+    current_block: u64,
+}
+
+impl<'a> BlockIter<'a> {
+    pub fn new(filter: &'a Filter) -> Self {
+        BlockIter {
+            filter,
+            current_block: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for BlockIter<'a> {
+    type Item = Block;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_block < self.filter.total_blocks().try_into().unwrap() {
+            let block = self.filter.block(self.current_block);
+            self.current_block += 1;
+            Some(block)
+        } else {
+            None
+        }
+    }
+}
+pub struct RunBlocksIter<'a> {
+    filter: &'a Filter,
+    q_bucket_idx: u64,
+    remaining: u64,
+}
+
+impl<'a> RunBlocksIter<'a> {
+    pub fn new(filter: &'a Filter) -> Self {
+        let mut iter = RunBlocksIter {
+            filter,
+            q_bucket_idx: 0,
+            remaining: filter.runs_count(),
+        };
+
+        if !filter.is_empty() {
+            while !filter.is_occupied(iter.q_bucket_idx) {
+                iter.q_bucket_idx += 1;
+            }
+        }
+
+        iter
+    }
+}
+
+impl<'a> Iterator for RunBlocksIter<'a> {
+    type Item = (u64, u64, u64, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(r) = self.remaining.checked_sub(1) {
+            self.remaining = r;
+        } else {
+            return None;
+        }
+        let run_start_idx = self.filter.run_start(self.q_bucket_idx);
+        let run_start_block = run_start_idx / 64;
+
+        let run_end_idx = self.filter.run_end(self.q_bucket_idx);
+        let run_end_block = run_end_idx / 64;
+
+        let run_start_block_idx = (run_start_block * self.filter.block_byte_size() as u64) as usize;
+
+        let run_end_block_idx =
+            ((run_end_block + 1) * self.filter.block_byte_size() as u64) as usize;
+
+        let blocks: Vec<u8>;
+        if run_end_block_idx > run_start_block_idx {
+            blocks = self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec();
+        } else {
+            blocks = [
+                &self.filter.buffer[run_start_block_idx..],
+                &self.filter.buffer[..run_end_block_idx],
+            ]
+            .concat()
+            .into_iter()
+            .collect();
+        }
+
+        let run_blocks_desc = (self.q_bucket_idx, run_start_idx, run_end_idx, blocks);
+
+        self.q_bucket_idx += 1;
+        while !self.filter.is_occupied(self.q_bucket_idx) {
+            self.q_bucket_idx += 1;
+        }
+
+        Some(run_blocks_desc)
+    }
+}
+
+pub struct RunIter<'a> {
+    filter: &'a Filter,
+    q_bucket_idx: u64,
+    r_bucket_idx: u64,
+    remaining: u64,
+}
+
+impl<'a> RunIter<'a> {
+    pub fn new(filter: &'a Filter) -> Self {
+        let mut iter = RunIter {
+            filter,
+            q_bucket_idx: 0,
+            r_bucket_idx: 0,
+            remaining: filter.len,
+        };
+
+        if !filter.is_empty() {
+            while !filter.is_occupied(iter.q_bucket_idx) {
+                iter.q_bucket_idx += 1;
+            }
+            iter.r_bucket_idx = filter.run_start(iter.q_bucket_idx);
+        }
+
+        iter
+    }
+}
+
+impl<'a> Iterator for RunIter<'a> {
+    type Item = (u64, u64, u64, u64, u64, u64, u64, u64, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(r) = self.remaining.checked_sub(1) {
+            self.remaining = r;
+        } else {
+            return None;
+        }
+        let hash = (self.q_bucket_idx << self.filter.rbits.get())
+            | self.filter.get_remainder(self.r_bucket_idx);
+
+        let run_start_idx = self.filter.run_start(self.q_bucket_idx);
+        let run_start_block = run_start_idx / 64;
+
+        let run_end_idx = self.filter.run_end(self.q_bucket_idx);
+        let run_end_block = run_end_idx / 64;
+
+        let run_start_block_idx = (run_start_block * self.filter.block_byte_size() as u64) as usize;
+
+        let run_end_block_idx =
+            ((run_end_block + 1) * self.filter.block_byte_size() as u64) as usize;
+
+        let block_cluster: Vec<u8>;
+        if run_end_block_idx > run_start_block_idx {
+            block_cluster = self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec();
+        } else {
+            block_cluster = [
+                &self.filter.buffer[run_start_block_idx..],
+                &self.filter.buffer[..run_end_block_idx],
+            ]
+            .concat()
+            .into_iter()
+            .collect();
+        }
+
+        let intra_r_bucket_block =
+            (self.r_bucket_idx / 64 - run_start_block) % self.filter.total_blocks();
+        let r_bucket_block = intra_r_bucket_block;
+        let intra_block_r_bucket_start_bit_idx =
+            self.filter.rbits.usize() * (self.r_bucket_idx % 64) as usize;
+        let intra_block_r_bucket_end_bit_idx =
+            intra_block_r_bucket_start_bit_idx + self.filter.rbits.usize();
+
+        let run_blocks_desc = (
+            hash,
+            self.q_bucket_idx,
+            self.r_bucket_idx,
+            r_bucket_block,
+            run_start_block,
+            run_end_block,
+            intra_block_r_bucket_start_bit_idx as u64,
+            intra_block_r_bucket_end_bit_idx as u64,
+            block_cluster,
+        );
+
+        if self.filter.is_runend(self.r_bucket_idx) {
+            self.q_bucket_idx += 1;
+            while !self.filter.is_occupied(self.q_bucket_idx) {
+                self.q_bucket_idx += 1;
+            }
+            self.r_bucket_idx = (self.r_bucket_idx + 1).max(self.q_bucket_idx);
+        } else {
+            self.r_bucket_idx += 1;
+        }
+
+        Some(run_blocks_desc)
     }
 }
 
@@ -567,7 +759,7 @@ impl Filter {
     }
 
     #[inline]
-    fn block_byte_size(&self) -> usize {
+    pub fn block_byte_size(&self) -> usize {
         1 + 8 + 8 + 64 * self.rbits.usize() / 8
     }
 
@@ -594,12 +786,23 @@ impl Filter {
         }
     }
 
-    #[inline]
-    fn block(&self, block_num: u64) -> Block {
+    fn block_bytes(&self, block_num: u64) -> &[u8] {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
-        let block_bytes: &[u8; 1 + 8 + 8] =
-            &self.buffer[block_start..][..1 + 8 + 8].try_into().unwrap();
+
+        &self.buffer[block_start..][..1 + 8 + 8]
+    }
+
+    fn block_bytes_with_r(&self, block_num: u64) -> &[u8] {
+        let block_num = block_num % self.total_blocks();
+        let block_start = block_num as usize * self.block_byte_size();
+
+        &self.buffer[block_start..][..self.block_byte_size()]
+    }
+
+    #[inline]
+    fn block(&self, block_num: u64) -> Block {
+        let block_bytes: &[u8; 1 + 8 + 8] = &self.block_bytes(block_num).try_into().unwrap();
         let offset = {
             if block_bytes[0] < u8::MAX {
                 block_bytes[0] as u64
@@ -723,7 +926,7 @@ impl Filter {
     }
 
     #[inline(always)]
-    fn get_remainder(&self, hash_bucket_idx: u64) -> u64 {
+    pub fn get_remainder(&self, hash_bucket_idx: u64) -> u64 {
         debug_assert!(self.rbits.get() > 0 && self.rbits.get() < 64);
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let remainders_start = (hash_bucket_idx / 64) as usize * self.block_byte_size() + 1 + 8 + 8;
@@ -914,16 +1117,25 @@ impl Filter {
         (self.run_end(prev_bucket) + 1) % self.total_buckets()
     }
 
+    #[inline]
+    fn run_start_block(&self, hash_bucket_idx: u64) -> u64 {
+        // runstart is equivalent to the runend of the previous bucket + 1.
+        self.run_start(hash_bucket_idx) / 64
+    }
+
     /// End idx of the end of the run (inclusive).
     fn run_end(&self, hash_bucket_idx: u64) -> u64 {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
+        // println!("run_end hash bucket idx: {hash_bucket_idx}");
         let bucket_block_idx = hash_bucket_idx / 64;
+        // println!("run_end bucket block idx: {bucket_block_idx}");
         let bucket_intrablock_offset = hash_bucket_idx % 64;
         let bucket_block = self.block(bucket_block_idx);
         let bucket_intrablock_rank = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
         // No occupied buckets all the way to bucket_intrablock_offset
         // which also means hash_bucket_idx isn't occupied
         if bucket_intrablock_rank == 0 {
+            // TODO: what is this?
             return if bucket_block.offset <= bucket_intrablock_offset {
                 // hash_bucket_idx points to an empty bucket unaffected by block offset,
                 // thus end == start
@@ -936,12 +1148,18 @@ impl Filter {
         }
 
         // Must search runends to figure out the end of the run
+        // println!("run_end bucket block offset: {}", bucket_block.offset);
+        // Is this block or next one?
         let mut runend_block_idx = bucket_block_idx + bucket_block.offset / 64;
+        // println!("run_end block idx: {runend_block_idx}");
         let mut runend_ignore_bits = bucket_block.offset % 64;
         let mut runend_block = self.raw_block(runend_block_idx);
         // Try to find the runend for the bucket in this block.
         // We're looking for the runend_rank'th bit set (0 based)
         let mut runend_rank = bucket_intrablock_rank - 1;
+
+        // println!("run_end ignore bits: {runend_ignore_bits}");
+        // println!("run_end rank: {runend_rank}");
         let mut runend_block_offset = runend_block
             .runends
             .select(runend_ignore_bits.., runend_rank);
@@ -954,24 +1172,43 @@ impl Filter {
         loop {
             // subtract any runend bits found
             runend_rank -= runend_block.runends.popcnt(runend_ignore_bits..);
+            // println!("run_end rank: {runend_rank}");
             // move to the next block
             runend_block_idx += 1;
             runend_ignore_bits = 0;
             runend_block = self.raw_block(runend_block_idx);
+            // println!("run_end block: {runend_block_idx}");
             runend_block_offset = runend_block
                 .runends
                 .select(runend_ignore_bits.., runend_rank);
 
             if let Some(runend_block_offset) = runend_block_offset {
+                // println!("run_end block offset: {runend_block_offset}");
                 let runend_idx = runend_block_idx * 64 + runend_block_offset;
+                // println!("run_end runend_idx: {runend_idx}");
+                // println!("run_end total buckets: {:}", self.total_buckets());
+                //
+                // println!(
+                //     "run_end runend_idx.max(hash_bucket_idx): {:}",
+                //     runend_idx.max(hash_bucket_idx)
+                // );
+                // println!(
+                //     "run_end runend_idx.max(hash_bucket_idx) % self.total_buckets(): {:}",
+                //     runend_idx.max(hash_bucket_idx) % self.total_buckets(),
+                // );
                 return runend_idx.max(hash_bucket_idx) % self.total_buckets();
             }
         }
     }
 
+    fn run_end_block(&self, hash_bucket_idx: u64) -> u64 {
+        self.run_end(hash_bucket_idx) / 64
+    }
+
     /// Returns whether item is present (probabilistically) in the filter.
-    pub fn contains<T: Hash>(&self, item: T) -> bool {
-        self.contains_fingerprint(self.hash(item))
+    pub fn contains(&self, item: u64) -> bool {
+        self.contains_fingerprint(item)
+        // self.contains_fingerprint(self.hash(item))
     }
 
     /// Returns whether the fingerprint is present (probabilistically) in the filter.
@@ -993,8 +1230,9 @@ impl Filter {
     }
 
     /// Returns the number of times the item appears (probabilistically) in the filter.
-    pub fn count<T: Hash>(&mut self, item: T) -> u64 {
-        self.count_fingerprint(self.hash(item))
+    pub fn count(&mut self, item: u64) -> u64 {
+        // self.count_fingerprint(self.hash(item))
+        self.count_fingerprint(item)
     }
 
     /// Returns the amount of times the fingerprint appears (probabilistically) in the filter.
@@ -1136,7 +1374,7 @@ impl Filter {
     ///
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     #[inline]
-    pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
+    pub fn insert_duplicated(&mut self, item: u64) -> Result<(), Error> {
         self.insert_counting(u64::MAX, item).map(|_| ())
     }
 
@@ -1148,7 +1386,7 @@ impl Filter {
     /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     #[inline]
-    pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
+    pub fn insert(&mut self, item: u64) -> Result<bool, Error> {
         self.insert_counting(1, item).map(|count| count == 0)
     }
 
@@ -1159,8 +1397,9 @@ impl Filter {
     /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
     /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
-    pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error> {
-        let hash = self.hash(item);
+    pub fn insert_counting(&mut self, max_count: u64, item: u64) -> Result<u64, Error> {
+        // let hash = self.hash(item);
+        let hash = item;
         match self.insert_impl(max_count, hash) {
             Ok(count) => Ok(count),
             Err(_) => {
@@ -1308,6 +1547,23 @@ impl Filter {
         FingerprintIter::new(self)
     }
 
+    pub fn runs(&self) -> RunIter {
+        RunIter::new(self)
+    }
+
+    pub fn run_blocks(&self) -> RunBlocksIter {
+        RunBlocksIter::new(self)
+    }
+
+    pub fn blocks(&self) -> BlockIter {
+        BlockIter::new(self)
+    }
+
+    pub fn runs_count(&self) -> u64 {
+        self.blocks()
+            .fold(0, |acc, block| acc + block.occupieds.popcnt(..))
+    }
+
     /// Shrinks the capacity of the filter as much as possible while preserving
     /// the false positive ratios and fingerprint size.
     pub fn shrink_to_fit(&mut self) {
@@ -1383,15 +1639,17 @@ impl Filter {
         hasher.finish()
     }
 
+    // This function simple return bucket idx, and remainder part
+    // But where we decide how much bits to use fo those parts?
     #[inline]
-    fn calc_qr(&self, hash: u64) -> (u64, u64) {
+    pub fn calc_qr(&self, hash: u64) -> (u64, u64) {
         let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
         let remainder = hash & ((1 << self.rbits.get()) - 1);
         (hash_bucket_idx, remainder)
     }
 
     #[inline]
-    fn total_blocks(&self) -> NonZeroU64 {
+    pub fn total_blocks(&self) -> NonZeroU64 {
         // The way this is calculated ensures the compilers sees that the result is both != 0 and a power of 2,
         // both of which allow the optimizer to generate much faster division/remainder code.
         #[cfg(any(debug_assertions, fuzzing))]
