@@ -1300,6 +1300,12 @@ impl Filter {
         self.run_end(hash_bucket_idx) / 64
     }
 
+    pub fn find_run<T: Hash>(&self, item: T) -> Option<(usize, Run)> {
+        let (q, _) = self.calc_qr(self.hash(item));
+        self.run_blocks()
+            .enumerate()
+            .find(|(_, run)| run.q_bucket_idx == q)
+    }
     /// Returns whether item is present (probabilistically) in the filter.
     pub fn contains<T: Hash>(&self, item: T) -> bool {
         self.contains_fingerprint(self.hash(item))
