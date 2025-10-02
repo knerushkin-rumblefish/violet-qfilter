@@ -380,64 +380,78 @@ impl Run {
         hasher.finish()
     }
 
+    fn is_occupied(&self, q_bucket_idx: u64) -> bool {
+        let q_block_bytes = &self.buffer[..1 + 8 + 8];
+
+        let occupieds = u64::from_le_bytes(q_block_bytes[1..][..8].try_into().unwrap());
+        occupieds.is_bit_set((q_bucket_idx % 64) as usize)
+    }
+
+    #[inline]
+    fn calc_qr(&self, hash: u64) -> (u64, u64) {
+        let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
+        let remainder = hash & ((1 << self.rbits.get()) - 1);
+        (hash_bucket_idx, remainder)
+    }
+
     pub fn contains<T: Hash>(&self, item: T) -> bool {
         let hash = self.hash(item);
-        let blocks_count = self.buffer.len() / self.block_byte_size();
+        let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
+
+        let run_blocks = &self.buffer[1 + 8 + 8..];
+
+        let blocks_count = run_blocks.len() / self.block_byte_size();
 
         let mut is_contains = false;
-        for block_num in 0..blocks_count {
-            let block_start_bit = block_num * self.block_byte_size();
 
-            let block_start = if block_num > 0 { block_start_bit } else { 0 };
-            let block_end = block_start + self.block_byte_size();
-            let block_bytes = &self.buffer[block_start..block_end];
+        if self.is_occupied(hash_bucket_idx % 64) {
+            for block_num in 0..blocks_count {
+                let block_start_bit = block_num * self.block_byte_size();
 
-            let reminders = &block_bytes[1 + 8 + 8..][..8 * self.rbits.usize()];
+                let block_start = if block_num > 0 { block_start_bit } else { 0 };
+                let block_end = block_start + self.block_byte_size();
+                let block_bytes = &run_blocks[block_start..block_end];
 
-            let mut run_start_intra_block_idx = 0;
-            let mut run_end_intra_block_idx = 63;
-            // single block
-            if block_num == 0 && blocks_count == 1 {
-                run_start_intra_block_idx = self.start_idx % 64;
-                run_end_intra_block_idx = self.end_idx % 64;
-                // first block in block sequence
-            } else if block_num == 0 {
-                run_start_intra_block_idx = self.start_idx % 64;
-            // last block in block sequence
-            } else if block_num == blocks_count - 1 {
-                run_end_intra_block_idx = self.end_idx % 64;
-            }
-            for bucket_idx in run_start_intra_block_idx..=run_end_intra_block_idx {
-                let bucket_start_bit = bucket_idx * self.rbits.u64();
-                let bucket_end_bit = bucket_start_bit + self.rbits.u64();
+                let reminders = &block_bytes[1 + 8 + 8..][..8 * self.rbits.usize()];
 
-                let start_u64 = (bucket_start_bit / 64) as usize;
-                let num_rem_parts = 1 + (bucket_end_bit > ((start_u64 + 1) * 64) as u64) as usize;
-
-                let extra_low = bucket_start_bit as usize - start_u64 * 64;
-                let extra_high = ((start_u64 + 1) * 64).saturating_sub(bucket_end_bit as usize);
-
-                let rem_parts_bytes = &reminders[start_u64 * 8..][..num_rem_parts * 8];
-                let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
-                let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
-
-                if let Some(rem_part) = rem_parts_bytes.get(8..16) {
-                    let remaining_bits = bucket_end_bit - ((start_u64 + 1) * 64) as u64;
-                    let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
-                    remainder |= (rem_part & !(u64::MAX << remaining_bits))
-                        << (self.rbits.u64() - remaining_bits);
+                let mut run_start_intra_block_idx = 0;
+                let mut run_end_intra_block_idx = 63;
+                // single block
+                if block_num == 0 && blocks_count == 1 {
+                    run_start_intra_block_idx = self.start_idx % 64;
+                    run_end_intra_block_idx = self.end_idx % 64;
+                    // first block in block sequence
+                } else if block_num == 0 {
+                    run_start_intra_block_idx = self.start_idx % 64;
+                // last block in block sequence
+                } else if block_num == blocks_count - 1 {
+                    run_end_intra_block_idx = self.end_idx % 64;
                 }
+                for bucket_idx in run_start_intra_block_idx..=run_end_intra_block_idx {
+                    let bucket_start_bit = bucket_idx * self.rbits.u64();
+                    let bucket_end_bit = bucket_start_bit + self.rbits.u64();
 
-                let current_quotient = self.q_bucket_idx;
-                let expected_quotient =
-                    (hash >> self.rbits.usize()) & ((1 << self.qbits.usize()) - 1);
+                    let start_u64 = (bucket_start_bit / 64) as usize;
+                    let num_rem_parts =
+                        1 + (bucket_end_bit > ((start_u64 + 1) * 64) as u64) as usize;
 
-                let current_remainder = remainder;
-                let expected_remainder = hash & ((1 << self.rbits.usize()) - 1);
+                    let extra_low = bucket_start_bit as usize - start_u64 * 64;
+                    let extra_high = ((start_u64 + 1) * 64).saturating_sub(bucket_end_bit as usize);
 
-                if expected_remainder == current_remainder && expected_quotient == current_quotient
-                {
-                    is_contains = true;
+                    let rem_parts_bytes = &reminders[start_u64 * 8..][..num_rem_parts * 8];
+                    let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
+                    let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
+
+                    if let Some(rem_part) = rem_parts_bytes.get(8..16) {
+                        let remaining_bits = bucket_end_bit - ((start_u64 + 1) * 64) as u64;
+                        let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
+                        remainder |= (rem_part & !(u64::MAX << remaining_bits))
+                            << (self.rbits.u64() - remaining_bits);
+                    }
+
+                    if hash_remainder == remainder && self.q_bucket_idx == hash_bucket_idx {
+                        is_contains = true;
+                    }
                 }
             }
         }
@@ -454,19 +468,11 @@ pub struct RunBlocksIter<'a> {
 
 impl<'a> RunBlocksIter<'a> {
     pub fn new(filter: &'a Filter) -> Self {
-        let mut iter = RunBlocksIter {
+        RunBlocksIter {
             filter,
             q_bucket_idx: 0,
-            remaining: filter.runs_count(),
-        };
-
-        if !filter.is_empty() {
-            while !filter.is_occupied(iter.q_bucket_idx) {
-                iter.q_bucket_idx += 1;
-            }
+            remaining: filter.total_buckets().get(),
         }
-
-        iter
     }
 }
 
@@ -479,40 +485,54 @@ impl<'a> Iterator for RunBlocksIter<'a> {
         } else {
             return None;
         }
-        let run_start_idx = self.filter.run_start(self.q_bucket_idx);
-        let run_start_block = run_start_idx / 64;
 
-        let run_end_idx = self.filter.run_end(self.q_bucket_idx);
-        let run_end_block = run_end_idx / 64;
+        let q_bucket_block_bytes = self.filter.block_bytes(self.q_bucket_idx / 64);
 
-        let run_start_block_idx = (run_start_block * self.filter.block_byte_size() as u64) as usize;
+        let item = if self.filter.is_occupied(self.q_bucket_idx) {
+            let run_start_idx = self.filter.run_start(self.q_bucket_idx);
+            let run_start_block = run_start_idx / 64;
 
-        let run_end_block_idx =
-            ((run_end_block + 1) * self.filter.block_byte_size() as u64) as usize;
+            let run_end_idx = self.filter.run_end(self.q_bucket_idx);
+            let run_end_block = run_end_idx / 64;
 
-        let blocks = if run_end_block_idx > run_start_block_idx {
-            self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec()
+            let run_start_block_idx =
+                (run_start_block * self.filter.block_byte_size() as u64) as usize;
+
+            let run_end_block_idx =
+                ((run_end_block + 1) * self.filter.block_byte_size() as u64) as usize;
+
+            let bytes = if run_end_block_idx > run_start_block_idx {
+                self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec()
+            } else {
+                [
+                    &self.filter.buffer[run_start_block_idx..],
+                    &self.filter.buffer[..run_end_block_idx],
+                ]
+                .concat()
+            };
+
+            Some(Run {
+                buffer: [q_bucket_block_bytes, &bytes].concat(),
+                q_bucket_idx: self.q_bucket_idx,
+                start_idx: run_start_idx,
+                end_idx: run_end_idx,
+                rbits: self.filter.rbits,
+                qbits: self.filter.qbits,
+            })
         } else {
-            [
-                &self.filter.buffer[run_start_block_idx..],
-                &self.filter.buffer[..run_end_block_idx],
-            ]
-            .concat()
+            Some(Run {
+                buffer: q_bucket_block_bytes.to_vec(),
+                q_bucket_idx: self.q_bucket_idx,
+                start_idx: 0,
+                end_idx: 0,
+                rbits: self.filter.rbits,
+                qbits: self.filter.qbits,
+            })
         };
-        let current_q_bucket_idx = self.q_bucket_idx;
-        self.q_bucket_idx = current_q_bucket_idx + 1;
-        while !self.filter.is_occupied(self.q_bucket_idx) {
-            self.q_bucket_idx += 1;
-        }
 
-        Some(Run {
-            buffer: blocks,
-            q_bucket_idx: current_q_bucket_idx,
-            start_idx: run_start_idx,
-            end_idx: run_end_idx,
-            rbits: self.filter.rbits,
-            qbits: self.filter.qbits,
-        })
+        self.q_bucket_idx += 1;
+
+        item
     }
 }
 
@@ -1658,9 +1678,8 @@ impl Filter {
         BlockIter::new(self)
     }
 
-    pub fn runs_count(&self) -> u64 {
-        self.blocks()
-            .fold(0, |acc, block| acc + block.occupieds.popcnt(..))
+    pub fn bucket_count(&self) -> u64 {
+        (1 << self.qbits.usize()) - 1
     }
 
     /// Shrinks the capacity of the filter as much as possible while preserving

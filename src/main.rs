@@ -29,13 +29,17 @@ fn main() {
             "item quotient: {} ({:064b})",
             item_q_bucket_idx, item_q_bucket_idx
         );
-        if let Some((index, item_potential_run)) = f
-            .run_blocks()
-            .enumerate()
-            .find(|(_, run)| run.q_bucket_idx == item_q_bucket_idx)
-        {
+        println!("run count: {}", f.run_blocks().count());
+        if let Some((index, item_potential_run)) = f.run_blocks().enumerate().find(|(_, run)| {
+            //println!("run {}", run.q_bucket_idx);
+            run.q_bucket_idx == item_q_bucket_idx
+        }) {
             println!("item potential run {:?}", item_potential_run.q_bucket_idx);
-            if item_potential_run.contains(*item) {
+            if f.contains(item) {
+                println!("item is contains in filter")
+            }
+            if item_potential_run.contains(item) {
+                println!("item is contains in run");
                 let item_membership_proof = merkle::build_proof_path(&merkle_leaves, index);
             };
         };
