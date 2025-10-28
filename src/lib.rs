@@ -54,6 +54,8 @@
 //! which incurs a ~10% performance penalty.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+use mem_dbg::MemSize;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
@@ -62,11 +64,12 @@ use std::{
 };
 
 pub mod merkle;
+pub mod packed;
 
 #[cfg(feature = "jsonschema")]
 use schemars::JsonSchema;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+// #[cfg(feature = "serde")]
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use stable_hasher::StableHasher;
 
 mod stable_hasher;
@@ -81,29 +84,17 @@ mod stable_hasher;
 ///
 /// The public API also exposes a fingerprint API, which can be used to succinctly store u64
 /// hash values.
-#[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
+#[derive(Clone, MemSize, Archive, Deserialize, Serialize, PartialEq)]
+#[repr(C)]
 pub struct Filter {
-    #[cfg_attr(
-        feature = "serde",
-        serde(
-            rename = "b",
-            serialize_with = "serde_bytes::serialize",
-            deserialize_with = "serde_bytes::deserialize"
-        )
-    )]
-    buffer: Box<[u8]>,
-    #[cfg_attr(feature = "serde", serde(rename = "l"))]
+    buffer: Vec<u8>,
+
     len: u64,
-    #[cfg_attr(feature = "serde", serde(rename = "q"))]
+
     pub qbits: NonZeroU8,
-    #[cfg_attr(feature = "serde", serde(rename = "r"))]
+
     pub rbits: NonZeroU8,
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "g", skip_serializing_if = "Option::is_none", default)
-    )]
+
     max_qbits: Option<NonZeroU8>,
 }
 
@@ -129,10 +120,10 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 #[derive(Debug)]
-struct Block {
-    offset: u64,
-    occupieds: u64,
-    runends: u64,
+pub struct Block {
+    pub offset: u64,
+    pub occupieds: u64,
+    pub runends: u64,
 }
 
 trait BitExt {
@@ -353,17 +344,22 @@ impl<'a> Iterator for BlockIter<'a> {
     }
 }
 
-#[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Run {
-    pub buffer: Vec<u8>,
-    pub q_bucket_idx: u64,
-    pub start_idx: u64,
-    pub end_idx: u64,
+#[derive(Clone, SerdeDeserialize, SerdeSerialize)]
+pub struct ByteBlock {
+    pub offset: usize,
+    pub bytes: Vec<u8>,
+}
 
-    #[cfg_attr(feature = "serde", serde(rename = "q"))]
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct Run {
+    pub run_blocks: Option<Vec<ByteBlock>>,
+    pub buffer: Vec<u8>,
+    pub q_bucket_block: ByteBlock,
+    pub q_bucket_idx: u64,
+    pub start_idx: Option<u64>,
+    pub end_idx: Option<u64>,
+
     pub qbits: NonZeroU8,
-    #[cfg_attr(feature = "serde", serde(rename = "r"))]
     pub rbits: NonZeroU8,
 }
 
@@ -404,53 +400,56 @@ impl Run {
 
         let mut is_contains = false;
 
-        if self.is_occupied(hash_bucket_idx % 64) {
-            for block_num in 0..blocks_count {
-                let block_start_bit = block_num * self.block_byte_size();
+        if let Some((start_idx, end_idx)) = self.start_idx.zip(self.end_idx) {
+            if self.is_occupied(hash_bucket_idx % 64) {
+                for block_num in 0..blocks_count {
+                    let block_start_bit = block_num * self.block_byte_size();
 
-                let block_start = if block_num > 0 { block_start_bit } else { 0 };
-                let block_end = block_start + self.block_byte_size();
-                let block_bytes = &run_blocks[block_start..block_end];
+                    let block_start = if block_num > 0 { block_start_bit } else { 0 };
+                    let block_end = block_start + self.block_byte_size();
+                    let block_bytes = &run_blocks[block_start..block_end];
 
-                let reminders = &block_bytes[1 + 8 + 8..][..8 * self.rbits.usize()];
+                    let reminders = &block_bytes[1 + 8 + 8..][..8 * self.rbits.usize()];
 
-                let mut run_start_intra_block_idx = 0;
-                let mut run_end_intra_block_idx = 63;
-                // single block
-                if block_num == 0 && blocks_count == 1 {
-                    run_start_intra_block_idx = self.start_idx % 64;
-                    run_end_intra_block_idx = self.end_idx % 64;
-                    // first block in block sequence
-                } else if block_num == 0 {
-                    run_start_intra_block_idx = self.start_idx % 64;
-                // last block in block sequence
-                } else if block_num == blocks_count - 1 {
-                    run_end_intra_block_idx = self.end_idx % 64;
-                }
-                for bucket_idx in run_start_intra_block_idx..=run_end_intra_block_idx {
-                    let bucket_start_bit = bucket_idx * self.rbits.u64();
-                    let bucket_end_bit = bucket_start_bit + self.rbits.u64();
-
-                    let start_u64 = (bucket_start_bit / 64) as usize;
-                    let num_rem_parts =
-                        1 + (bucket_end_bit > ((start_u64 + 1) * 64) as u64) as usize;
-
-                    let extra_low = bucket_start_bit as usize - start_u64 * 64;
-                    let extra_high = ((start_u64 + 1) * 64).saturating_sub(bucket_end_bit as usize);
-
-                    let rem_parts_bytes = &reminders[start_u64 * 8..][..num_rem_parts * 8];
-                    let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
-                    let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
-
-                    if let Some(rem_part) = rem_parts_bytes.get(8..16) {
-                        let remaining_bits = bucket_end_bit - ((start_u64 + 1) * 64) as u64;
-                        let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
-                        remainder |= (rem_part & !(u64::MAX << remaining_bits))
-                            << (self.rbits.u64() - remaining_bits);
+                    let mut run_start_intra_block_idx = 0;
+                    let mut run_end_intra_block_idx = 63;
+                    // single block
+                    if block_num == 0 && blocks_count == 1 {
+                        run_start_intra_block_idx = start_idx % 64;
+                        run_end_intra_block_idx = end_idx % 64;
+                        // first block in block sequence
+                    } else if block_num == 0 {
+                        run_start_intra_block_idx = start_idx % 64;
+                    // last block in block sequence
+                    } else if block_num == blocks_count - 1 {
+                        run_end_intra_block_idx = end_idx % 64;
                     }
+                    for bucket_idx in run_start_intra_block_idx..=run_end_intra_block_idx {
+                        let bucket_start_bit = bucket_idx * self.rbits.u64();
+                        let bucket_end_bit = bucket_start_bit + self.rbits.u64();
 
-                    if hash_remainder == remainder && self.q_bucket_idx == hash_bucket_idx {
-                        is_contains = true;
+                        let start_u64 = (bucket_start_bit / 64) as usize;
+                        let num_rem_parts =
+                            1 + (bucket_end_bit > ((start_u64 + 1) * 64) as u64) as usize;
+
+                        let extra_low = bucket_start_bit as usize - start_u64 * 64;
+                        let extra_high =
+                            ((start_u64 + 1) * 64).saturating_sub(bucket_end_bit as usize);
+
+                        let rem_parts_bytes = &reminders[start_u64 * 8..][..num_rem_parts * 8];
+                        let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
+                        let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
+
+                        if let Some(rem_part) = rem_parts_bytes.get(8..16) {
+                            let remaining_bits = bucket_end_bit - ((start_u64 + 1) * 64) as u64;
+                            let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
+                            remainder |= (rem_part & !(u64::MAX << remaining_bits))
+                                << (self.rbits.u64() - remaining_bits);
+                        }
+
+                        if hash_remainder == remainder && self.q_bucket_idx == hash_bucket_idx {
+                            is_contains = true;
+                        }
                     }
                 }
             }
@@ -486,7 +485,8 @@ impl<'a> Iterator for RunBlocksIter<'a> {
             return None;
         }
 
-        let q_bucket_block_bytes = self.filter.block_bytes(self.q_bucket_idx / 64);
+        let block_num = self.q_bucket_idx / 64;
+        let (q_bucket_block_offset, q_bucket_block_bytes) = self.filter.block_buffers(block_num);
 
         let item = if self.filter.is_occupied(self.q_bucket_idx) {
             let run_start_idx = self.filter.run_start(self.q_bucket_idx);
@@ -511,20 +511,48 @@ impl<'a> Iterator for RunBlocksIter<'a> {
                 .concat()
             };
 
+            let run_buffers = if run_end_block_idx > run_start_block_idx {
+                vec![ByteBlock {
+                    bytes: self.filter.buffer[run_start_block_idx..run_end_block_idx].to_vec(),
+                    offset: run_start_block_idx,
+                }]
+            } else {
+                vec![
+                    ByteBlock {
+                        bytes: self.filter.buffer[run_start_block_idx..].to_vec(),
+                        offset: run_start_block_idx,
+                    },
+                    ByteBlock {
+                        bytes: self.filter.buffer[..run_end_block_idx].to_vec(),
+                        offset: 0,
+                    },
+                ]
+            };
+
             Some(Run {
-                buffer: [q_bucket_block_bytes, &bytes].concat(),
+                run_blocks: Some(run_buffers),
+                buffer: [q_bucket_block_bytes.clone(), bytes.clone()].concat(),
+                q_bucket_block: ByteBlock {
+                    offset: q_bucket_block_offset,
+                    bytes: q_bucket_block_bytes.to_vec().clone(),
+                },
                 q_bucket_idx: self.q_bucket_idx,
-                start_idx: run_start_idx,
-                end_idx: run_end_idx,
+                start_idx: Some(run_start_idx),
+                end_idx: Some(run_end_idx),
                 rbits: self.filter.rbits,
                 qbits: self.filter.qbits,
             })
         } else {
             Some(Run {
-                buffer: q_bucket_block_bytes.to_vec(),
+                run_blocks: None,
+                buffer: q_bucket_block_bytes.to_vec().clone(),
+                q_bucket_block: ByteBlock {
+                    offset: q_bucket_block_offset,
+                    bytes: q_bucket_block_bytes,
+                },
                 q_bucket_idx: self.q_bucket_idx,
-                start_idx: 0,
-                end_idx: 0,
+                start_idx: None,
+                end_idx: None,
                 rbits: self.filter.rbits,
                 qbits: self.filter.qbits,
             })
@@ -783,7 +811,7 @@ impl Filter {
         assert_ne!(num_blocks, 0);
         let block_bytes_size = 1 + 16 + 64 * rbits.u64() / 8;
         let buffer_bytes = num_blocks * block_bytes_size;
-        let buffer = vec![0u8; buffer_bytes.try_into().unwrap()].into_boxed_slice();
+        let buffer = vec![0u8; buffer_bytes.try_into().unwrap()];
         Ok(Self {
             buffer,
             qbits,
@@ -902,14 +930,24 @@ impl Filter {
         }
     }
 
-    fn block_bytes(&self, block_num: u64) -> &[u8] {
+    fn block_buffers(&self, block_num: u64) -> (usize, Vec<u8>) {
         let block_num = block_num % self.total_blocks();
-        let block_start = block_num as usize * self.block_byte_size();
+        let block_offset = block_num as usize * self.block_byte_size();
 
-        &self.buffer[block_start..][..1 + 8 + 8]
+        (
+            block_offset,
+            self.buffer[block_offset..][..1 + 8 + 8].to_vec(),
+        )
     }
 
-    fn block_bytes_with_r(&self, block_num: u64) -> &[u8] {
+    pub fn block_bytes(&self, block_num: u64) -> &[u8] {
+        let block_num = block_num % self.total_blocks();
+        let block_offset = block_num as usize * self.block_byte_size();
+
+        &self.buffer[block_offset..][..1 + 8 + 8]
+    }
+
+    pub fn block_bytes_with_r(&self, block_num: u64) -> &[u8] {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
 
@@ -917,7 +955,7 @@ impl Filter {
     }
 
     #[inline]
-    fn block(&self, block_num: u64) -> Block {
+    pub fn block(&self, block_num: u64) -> Block {
         let block_bytes: &[u8; 1 + 8 + 8] = &self.block_bytes(block_num).try_into().unwrap();
         let offset = {
             if block_bytes[0] < u8::MAX {
@@ -1242,9 +1280,7 @@ impl Filter {
     /// End idx of the end of the run (inclusive).
     fn run_end(&self, hash_bucket_idx: u64) -> u64 {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
-        // println!("run_end hash bucket idx: {hash_bucket_idx}");
         let bucket_block_idx = hash_bucket_idx / 64;
-        // println!("run_end bucket block idx: {bucket_block_idx}");
         let bucket_intrablock_offset = hash_bucket_idx % 64;
         let bucket_block = self.block(bucket_block_idx);
         let bucket_intrablock_rank = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
@@ -1319,6 +1355,18 @@ impl Filter {
 
     fn run_end_block(&self, hash_bucket_idx: u64) -> u64 {
         self.run_end(hash_bucket_idx) / 64
+    }
+
+    pub fn block_contains_runs(&self, block_num: u64) -> Vec<Run> {
+        self.run_blocks()
+            .filter(|run| {
+                if let Some((start_idx, end_idx)) = run.start_idx.zip(run.end_idx) {
+                    start_idx / 64 == block_num || end_idx / 64 == block_num
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     pub fn find_run<T: Hash>(&self, item: T) -> Option<(usize, Run)> {
@@ -2258,33 +2306,33 @@ mod tests {
             Filter::new(1, 0.0001).unwrap(),
         );
     }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_serde() {
-        for capacity in [100, 1000, 10000] {
-            for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
-                let mut f = Filter::new(capacity, fp_ratio).unwrap();
-                for i in 0..f.capacity() {
-                    f.insert(i).unwrap();
-                }
-
-                let ser = serde_cbor::to_vec(&f).unwrap();
-                f = serde_cbor::from_slice(&ser).unwrap();
-                for i in 0..f.capacity() {
-                    f.contains(i);
-                }
-                dbg!(
-                    f.current_error_ratio(),
-                    f.max_error_ratio(),
-                    f.capacity(),
-                    f.len(),
-                    ser.len()
-                );
-            }
-        }
-    }
-
+    //
+    // #[cfg(feature = "serde")]
+    // #[test]
+    // fn test_serde() {
+    //     for capacity in [100, 1000, 10000] {
+    //         for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
+    //             let mut f = Filter::new(capacity, fp_ratio).unwrap();
+    //             for i in 0..f.capacity() {
+    //                 f.insert(i).unwrap();
+    //             }
+    //
+    //             let ser = serde_cbor::to_vec(&f).unwrap();
+    //             f = serde_cbor::from_slice(&ser).unwrap();
+    //             for i in 0..f.capacity() {
+    //                 f.contains(i);
+    //             }
+    //             dbg!(
+    //                 f.current_error_ratio(),
+    //                 f.max_error_ratio(),
+    //                 f.capacity(),
+    //                 f.len(),
+    //                 ser.len()
+    //             );
+    //         }
+    //     }
+    // }
+    //
     #[test]
     fn test_dec_offset_edge_case() {
         // case found in fuzz testing

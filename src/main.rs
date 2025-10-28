@@ -1,7 +1,11 @@
 use qfilter::merkle;
+use qfilter::packed;
 
-use rand::{rng, Rng};
+use itertools::Itertools;
+use rand::{rand_core::block, rng, Rng};
 use std::hash::Hash;
+
+const CELESTIA_SAMPLE_SIZE: usize = 482;
 
 fn main() {
     let items_len = 100000;
@@ -44,4 +48,64 @@ fn main() {
             };
         };
     };
+
+    println!("Packing blocks in 512 chunks");
+
+    let mut packed_qf: Vec<packed::PackedBlocks> = vec![];
+
+    let sample_block_num = CELESTIA_SAMPLE_SIZE / f.block_byte_size();
+
+    let total_blocks = f.total_blocks().get() as u64;
+    for block_range_start in (0..5).step_by(sample_block_num) {
+        let block_range_end = (block_range_start + sample_block_num as u64).min(total_blocks);
+
+        let mut packed_blocks = packed::PackedBlocks::default();
+        packed_blocks.first_block_idx = block_range_start;
+        packed_blocks.rbits = f.rbits.get() as u8;
+        packed_blocks.qbits = f.qbits.get() as u8;
+        packed_blocks.blocks_num = (block_range_end - block_range_start) as u8;
+
+        for block_num in block_range_start..block_range_end {
+            let runs = f.block_contains_runs(block_num);
+            let runs_idx: Vec<u64> = runs.iter().map(|run| run.q_bucket_idx).collect();
+            let block = f.block(block_num);
+            let block_bytes: Vec<u8> = f.block_bytes_with_r(block_num).to_vec();
+
+            println!("offset: {}", block.offset);
+            println!("occupiends [{:b}]", block.occupieds);
+            println!("runends [{:b}]", block.runends);
+
+            println!(
+                "block {block_num} contains {:?} [{:?}, {:?}]",
+                runs.len(),
+                block_num * 64,
+                block_num * 64 + 64,
+            );
+            if let Some((first_run_idx, last_run_idx)) = runs_idx.first().zip(runs_idx.last()) {
+                println!("runs [{}, {}]", first_run_idx, last_run_idx);
+                println!("runs idxs {:?}", runs_idx);
+            }
+
+            packed_blocks.first_run_idx = runs_idx
+                .first()
+                .map(|&first_run_idx| {
+                    packed_blocks
+                        .first_run_idx
+                        .map(|current_first_run_idx| current_first_run_idx.min(first_run_idx))
+                        .unwrap_or(first_run_idx)
+                })
+                .or(packed_blocks.first_run_idx);
+
+            packed_blocks.buffer.append(&mut block_bytes.to_vec());
+            println!("packed: {:?}", packed_blocks);
+
+            let from_packed_block = packed_blocks.raw_block(block_num);
+            println!("offset: {}", from_packed_block.offset);
+            println!("occupiends [{:b}]", from_packed_block.occupieds);
+            println!("runends [{:b}]", from_packed_block.runends);
+        }
+        packed_qf.push(packed_blocks);
+    }
+
+    println!("Packed blocks in 512 chunks");
 }
