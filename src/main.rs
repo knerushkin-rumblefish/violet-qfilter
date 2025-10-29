@@ -1,5 +1,6 @@
 use qfilter::merkle;
 use qfilter::packed;
+use std::io;
 
 use itertools::Itertools;
 use rand::{rand_core::block, rng, Rng};
@@ -56,18 +57,49 @@ fn main() {
     let sample_block_num = CELESTIA_SAMPLE_SIZE / f.block_byte_size();
 
     let total_blocks = f.total_blocks().get() as u64;
-    for block_range_start in (0..5).step_by(sample_block_num) {
+    for block_range_start in (0..10).step_by(sample_block_num) {
         let block_range_end = (block_range_start + sample_block_num as u64).min(total_blocks);
 
+        let mut packed_runs: Vec<qfilter::Run> = vec![];
         let mut packed_blocks = packed::PackedBlocks::default();
-        packed_blocks.first_block_idx = block_range_start;
+        packed_blocks.block_offset = block_range_start;
+        packed_blocks.blocks_num = (block_range_end - block_range_start) as u8;
         packed_blocks.rbits = f.rbits.get() as u8;
         packed_blocks.qbits = f.qbits.get() as u8;
-        packed_blocks.blocks_num = (block_range_end - block_range_start) as u8;
 
         for block_num in block_range_start..block_range_end {
-            let runs = f.block_contains_runs(block_num);
+            println!(
+                "________________________ block {} ------------------------",
+                block_num
+            );
+            println!("packed blocks: {:?}", packed_blocks);
+            let mut buffer = String::new();
+            let mut runs = f.block_contains_runs(block_num);
             let runs_idx: Vec<u64> = runs.iter().map(|run| run.q_bucket_idx).collect();
+
+            #[derive(Debug)]
+            struct RunSpan {
+                idx: u64,
+                start: u64,
+                end: u64,
+            }
+            let run_spans: Vec<RunSpan> = runs
+                .iter()
+                .filter_map(|run| {
+                    if let Some((start, end)) = run.start_idx.zip(run.end_idx) {
+                        Some(RunSpan {
+                            idx: run.q_bucket_idx,
+                            start,
+                            end,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            println!("run spans: {:?}", run_spans);
+            packed_runs.append(&mut runs);
             let block = f.block(block_num);
             let block_bytes: Vec<u8> = f.block_bytes_with_r(block_num).to_vec();
 
@@ -81,11 +113,6 @@ fn main() {
                 block_num * 64,
                 block_num * 64 + 64,
             );
-            if let Some((first_run_idx, last_run_idx)) = runs_idx.first().zip(runs_idx.last()) {
-                println!("runs [{}, {}]", first_run_idx, last_run_idx);
-                println!("runs idxs {:?}", runs_idx);
-            }
-
             packed_blocks.first_run_idx = runs_idx
                 .first()
                 .map(|&first_run_idx| {
@@ -97,13 +124,27 @@ fn main() {
                 .or(packed_blocks.first_run_idx);
 
             packed_blocks.buffer.append(&mut block_bytes.to_vec());
-            println!("packed: {:?}", packed_blocks);
-
             let from_packed_block = packed_blocks.raw_block(block_num);
             println!("offset: {}", from_packed_block.offset);
             println!("occupiends [{:b}]", from_packed_block.occupieds);
             println!("runends [{:b}]", from_packed_block.runends);
+            // io::stdin()
+            //     .read_line(&mut buffer)
+            //     .expect("Failed to read line");
+
+            println!(
+                "________________________ block {} end --------------------",
+                block_num
+            );
         }
+
+        packed_runs.iter().for_each(|run| {
+            let runs_span = packed_blocks.runs_span();
+            if run.q_bucket_idx > runs_span.0 && run.q_bucket_idx < runs_span.1 {
+                println!("run end for {}", run.q_bucket_idx);
+                println!("run end: {}", packed_blocks.run_end(run.q_bucket_idx));
+            }
+        });
         packed_qf.push(packed_blocks);
     }
 

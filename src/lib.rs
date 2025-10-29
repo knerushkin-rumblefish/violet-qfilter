@@ -1353,10 +1353,6 @@ impl Filter {
         }
     }
 
-    fn run_end_block(&self, hash_bucket_idx: u64) -> u64 {
-        self.run_end(hash_bucket_idx) / 64
-    }
-
     pub fn block_contains_runs(&self, block_num: u64) -> Vec<Run> {
         self.run_blocks()
             .filter(|run| {
