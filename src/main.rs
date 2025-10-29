@@ -8,8 +8,15 @@ use std::hash::Hash;
 
 const CELESTIA_SAMPLE_SIZE: usize = 482;
 
+#[derive(Debug)]
+struct RunSpan {
+    idx: u64,
+    start: u64,
+    end: u64,
+}
+
 fn main() {
-    let items_len = 100000;
+    let items_len = 1000;
     let mut f = qfilter::Filter::new(items_len, 0.005).unwrap();
 
     let mut items: Vec<[u8; 32]> = vec![];
@@ -77,28 +84,6 @@ fn main() {
             let mut runs = f.block_contains_runs(block_num);
             let runs_idx: Vec<u64> = runs.iter().map(|run| run.q_bucket_idx).collect();
 
-            #[derive(Debug)]
-            struct RunSpan {
-                idx: u64,
-                start: u64,
-                end: u64,
-            }
-            let run_spans: Vec<RunSpan> = runs
-                .iter()
-                .filter_map(|run| {
-                    if let Some((start, end)) = run.start_idx.zip(run.end_idx) {
-                        Some(RunSpan {
-                            idx: run.q_bucket_idx,
-                            start,
-                            end,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            println!("run spans: {:?}", run_spans);
             packed_runs.append(&mut runs);
             let block = f.block(block_num);
             let block_bytes: Vec<u8> = f.block_bytes_with_r(block_num).to_vec();
@@ -113,15 +98,10 @@ fn main() {
                 block_num * 64,
                 block_num * 64 + 64,
             );
-            packed_blocks.first_run_idx = runs_idx
+            packed_blocks.first_runstart_idx = runs_idx
                 .first()
-                .map(|&first_run_idx| {
-                    packed_blocks
-                        .first_run_idx
-                        .map(|current_first_run_idx| current_first_run_idx.min(first_run_idx))
-                        .unwrap_or(first_run_idx)
-                })
-                .or(packed_blocks.first_run_idx);
+                .map(|&first_runstart_idx| packed_blocks.first_runstart_idx.min(first_runstart_idx))
+                .expect("error: first runstart ids");
 
             packed_blocks.buffer.append(&mut block_bytes.to_vec());
             let from_packed_block = packed_blocks.raw_block(block_num);
@@ -137,14 +117,52 @@ fn main() {
                 block_num
             );
         }
-
-        packed_runs.iter().for_each(|run| {
-            let runs_span = packed_blocks.runs_span();
-            if run.q_bucket_idx > runs_span.0 && run.q_bucket_idx < runs_span.1 {
-                println!("run end for {}", run.q_bucket_idx);
-                println!("run end: {}", packed_blocks.run_end(run.q_bucket_idx));
+        let mut contains_count = 0;
+        for item in items.iter() {
+            println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+            if packed_blocks.contains(item) {
+                contains_count += 1;
+                println!("packed blocks contains {} items", contains_count);
             }
-        });
+        }
+
+        println!("packed blocks contains {} items", contains_count);
+        let run_spans: Vec<RunSpan> = packed_runs
+            .iter()
+            .filter_map(|run| {
+                if let Some((start, end)) = run.start_idx.zip(run.end_idx) {
+                    Some(RunSpan {
+                        idx: run.q_bucket_idx,
+                        start,
+                        end,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count_buckets: u64 = run_spans
+            .iter()
+            .map(|run_span| {
+                let buckets_num = run_span.end - run_span.start + 1;
+                // println!("buckets num: {}", buckets_num);
+                buckets_num
+            })
+            .sum();
+        let count_runs = packed_runs.len();
+        println!("count packed runs : {}", count_runs);
+        println!("count packed runs bukcets: {}", count_buckets);
+
+        // packed_runs.iter().for_each(|run| {
+        //     // let runs_span = packed_blocks.runs_span();
+        //
+        //     // if run.q_bucket_idx > runs_span.0 && run.q_bucket_idx < runs_span.1 {
+        //     //     println!("run end for {}", run.q_bucket_idx);
+        //     //     println!("run end: {}", packed_blocks.run_end(run.q_bucket_idx));
+        //     // }
+        //
+        // });
         packed_qf.push(packed_blocks);
     }
 

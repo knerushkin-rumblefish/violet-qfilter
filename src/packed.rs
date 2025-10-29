@@ -9,19 +9,23 @@ pub struct PackedBlocks {
     pub block_offset: u64,
     pub blocks_num: u8,
 
-    pub first_run_idx: Option<u64>,
+    pub first_runstart_idx: u64,
+    //          block0 [
+    //                   (run02 (s02N)],
+    //                   [run01 (s011, s012, .., s011N)],
+    //                 ],
     //        ________________________________________________
-    // packed | block0 [                                     |
-    //        |           [run01 (s011, s012, .., s01N)]     |
+    // packed | block1 [                                     |
+    //        |           [run11 (s111, s112, .., s11N)]     |
     //        |        ],                                    |
-    //        | block1 [                                     |
-    //        |          [run11 (s111, s112, .., s11N)],     |
-    //    >>> |          [run12 (s121, s122, .., s12(N - 1)) | >>> shifted
+    //        | block2 [                                     |
+    //        |          [run21 (s211, s212, .., s21N)],     |
+    //    >>> |          [run22 (s221, s222, .., s22(N - 1)) | >>> shifted
     //        |        ],                                    |
     //        ________________________________________________
-    //          block2 [
-    //                   (run12 (s12N)],
-    //                   [run21 (s211, s212, .., s211N)],
+    //          block3 [
+    //                   (run22 (s22N)],
+    //                   [run31 (s311, s312, .., s311N)],
     //                 ],
     pub shifted: bool,
 }
@@ -84,13 +88,9 @@ impl PackedBlocks {
     pub fn raw_block(&self, block_num: u64) -> Block {
         // no option to have circular block probing
         // let block_num = block_num % self.total_blocks();
-        println!("block number: {}", block_num);
+        //
         let block_num = self.normilize_block_num(block_num);
         let block_start = block_num as usize * self.block_byte_size();
-        println!(
-            "PackedBlocks: block_start: {block_start}, buffer len: {}",
-            self.buffer.len()
-        );
         let block_bytes: &[u8; 1 + 8 + 8] =
             &self.buffer[block_start..][..1 + 8 + 8].try_into().unwrap();
         Block {
@@ -103,7 +103,6 @@ impl PackedBlocks {
     // End idx of the end of the run (inclusive).
     pub fn run_end(&self, hash_bucket_idx: u64) -> u64 {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
-        // let hash_bucket_idx = self.normilize_bucket_idx(hash_bucket_idx);
         let bucket_block_idx = hash_bucket_idx / 64;
         let bucket_intrablock_offset = hash_bucket_idx % 64;
 
@@ -112,7 +111,7 @@ impl PackedBlocks {
         // No occupied buckets all the way to bucket_intrablock_offset
         // which also means hash_bucket_idx isn't occupied
         if bucket_intrablock_rank == 0 {
-            // TODO: what is this?
+            // TODO: WTF???
             return if bucket_block.offset <= bucket_intrablock_offset {
                 // hash_bucket_idx points to an empty bucket unaffected by block offset,
                 // thus end == start
@@ -120,6 +119,7 @@ impl PackedBlocks {
             } else {
                 // hash_bucket_idx fall within the section occupied by the offset,
                 // thus end == last bucket of offset section
+                // TODO: WTF???
                 (bucket_block_idx * 64 + bucket_block.offset - 1) % self.total_buckets()
             };
         }
@@ -181,7 +181,15 @@ impl PackedBlocks {
 
     #[inline]
     fn run_start(&self, hash_bucket_idx: u64) -> u64 {
+        // TODO: prev bucket id can be out of packed blocs scope
+        let first_block_first_bucket_idx = self.block_offset * 64;
+        if hash_bucket_idx == first_block_first_bucket_idx {
+            return self.first_runstart_idx;
+        }
+        // TODO: no restrictions on hash_bucket_idx but we're expect hash_bucket_idx to belong to
+        // packed blocks slots
         let prev_bucket = hash_bucket_idx.wrapping_sub(1) % self.total_buckets();
+
         (self.run_end(prev_bucket) + 1) % self.total_buckets()
     }
 
@@ -191,7 +199,7 @@ impl PackedBlocks {
         // TODO: should buffer on packed blocks level contains padding to 482 bytes?
         // the block offset can be calculated as the difference between its position and runstart.
         let block_start = block_num * 64;
-        let mut run_start = self.run_start(block_start);
+        let run_start = self.run_start(block_start);
         // TODO: how to handle this rotating property of linear probing
         // in regular case run_start is >= block_start but if it's rotate over buffer end its
         // circulate in beginning of buffer, in case of packing it by chunks it's require to
@@ -204,7 +212,6 @@ impl PackedBlocks {
 
     #[inline]
     pub fn block(&self, block_num: u64) -> Block {
-        println!("block: {}", block_num);
         let block_num = self.normilize_block_num(block_num);
         let block_bytes: &[u8; 1 + 8 + 8] = &self.block_bytes(block_num).try_into().unwrap();
         let offset = {
@@ -227,15 +234,10 @@ impl PackedBlocks {
         let first_block_first_bucket_idx = self.block_offset * 64;
         let last_block_last_bucket_idx =
             first_block_first_bucket_idx + ((self.blocks_num as u64) * 64) - 1;
-        println!(
-            "validate_bucket_idx: {} < {} <= {}",
-            first_block_first_bucket_idx, bucket_idx, last_block_last_bucket_idx
-        );
         bucket_idx >= first_block_first_bucket_idx && bucket_idx < last_block_last_bucket_idx
     }
 
     pub fn normilize_bucket_idx(&self, bucket_idx: u64) -> u64 {
-        println!("normilize_bucket_idx: {}", bucket_idx);
         assert!(self.validate_bucket_idx(bucket_idx));
         let first_block_first_bucket_idx = self.block_offset * 64;
         bucket_idx - first_block_first_bucket_idx
@@ -258,13 +260,105 @@ impl PackedBlocks {
         )
     }
 
-    // pub fn contains<T: Hash>(&self, item: T) -> bool {
-    //     let hash = self.hash(item);
-    //     let (q_bucket_idx, remainder) = self.calc_qr(hash);
-    //
-    //     let bucket_block_idx = self.normilize_bucket_block_idx(q_bucket_idx / 64);
-    //     let bucket_intrablock_offset = q_bucket_idx % 64;
-    //
-    //     let bucket_block = self.block(bucket_block_idx);
-    // }
+    #[inline(always)]
+    fn is_occupied(&self, hash_bucket_idx: u64) -> bool {
+        println!(
+            "packed blocks: is_occupied hash_bukcet_idx {}",
+            hash_bucket_idx
+        );
+        let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
+        let hash_bucket_block_idx = hash_bucket_idx / 64;
+        let hash_bucket_block_idx = self.normilize_block_num(hash_bucket_block_idx);
+        println!(
+            "packed blocks: is_occupied block_num {}",
+            hash_bucket_block_idx
+        );
+        let block_start = hash_bucket_block_idx as usize * self.block_byte_size();
+        println!("packed blocks: is_occupied block_start {}", block_start);
+        let occupieds = u64::from_le_bytes(self.buffer[block_start + 1..][..8].try_into().unwrap());
+        occupieds.is_bit_set((hash_bucket_idx % 64) as usize)
+    }
+
+    #[inline(always)]
+    fn is_runend(&self, hash_bucket_idx: u64) -> bool {
+        let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
+        let hash_bucket_block_idx = hash_bucket_idx / 64;
+        let hash_bucket_block_idx = self.normilize_block_num(hash_bucket_block_idx);
+        let block_start = hash_bucket_block_idx as usize * self.block_byte_size();
+
+        let runends =
+            u64::from_le_bytes(self.buffer[block_start + 1 + 8..][..8].try_into().unwrap());
+        runends.is_bit_set((hash_bucket_idx % 64) as usize)
+    }
+
+    #[inline(always)]
+    pub fn get_remainder(&self, hash_bucket_idx: u64) -> u64 {
+        println!("packed blocks: get_remainder");
+        debug_assert!(self.rbits > 0 && self.rbits < 64);
+        let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
+
+        let hash_bucket_block_idx = hash_bucket_idx / 64;
+        let hash_bucket_block_idx = self.normilize_block_num(hash_bucket_block_idx);
+
+        println!(
+            "packed blocks: get_remainder hash_bucket_block_idx: {}",
+            hash_bucket_block_idx
+        );
+        let block_start = hash_bucket_block_idx as usize * self.block_byte_size();
+
+        println!("packed blocks: get_remainder block_start: {}", block_start);
+
+        let remainders_start = block_start + 1 + 8 + 8;
+        let start_bit_idx = self.rbits as usize * (hash_bucket_idx % 64) as usize;
+        let end_bit_idx = start_bit_idx + self.rbits as usize;
+        let start_u64 = start_bit_idx / 64;
+        let num_rem_parts = 1 + (end_bit_idx > (start_u64 + 1) * 64) as usize;
+        let rem_parts_bytes = &self.buffer[remainders_start + start_u64 * 8..][..num_rem_parts * 8];
+        let extra_low = start_bit_idx - start_u64 * 64;
+        let extra_high = ((start_u64 + 1) * 64).saturating_sub(end_bit_idx);
+        let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
+        // zero high bits & truncate low bits
+        let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
+        if let Some(rem_part) = rem_parts_bytes.get(8..16) {
+            let remaining_bits = end_bit_idx - (start_u64 + 1) * 64;
+            let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
+            remainder |= (rem_part & !(u64::MAX << remaining_bits))
+                << (self.rbits as usize - remaining_bits);
+        }
+        debug_assert!(remainder.leading_zeros() >= 64 - self.rbits as u32);
+        remainder
+    }
+
+    pub fn contains<T: Hash>(&self, item: T) -> bool {
+        let hash = self.hash(item);
+        let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
+        println!(
+            "packed blocks contains: hash_bucket_idx {}",
+            hash_bucket_idx
+        );
+
+        if !self.validate_bucket_idx(hash_bucket_idx) {
+            return false;
+        }
+
+        if !self.is_occupied(hash_bucket_idx) {
+            return false;
+        }
+
+        let mut runstart_idx = self.run_start(hash_bucket_idx);
+
+        loop {
+            println!("packed blocks contains: runstart_idx: {}", runstart_idx);
+            let reminder = self.get_remainder(runstart_idx);
+            println!("packed blocks contains: reminder: {}", reminder);
+            println!("packed blocks contains: hash_reminder: {}", hash_remainder);
+            if hash_remainder == reminder {
+                return true;
+            }
+            if self.is_runend(runstart_idx) {
+                return false;
+            }
+            runstart_idx += 1;
+        }
+    }
 }
