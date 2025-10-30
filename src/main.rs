@@ -1,5 +1,6 @@
 use qfilter::merkle;
-use qfilter::packed;
+use qfilter::{packed, run};
+
 use std::io;
 
 use itertools::Itertools;
@@ -61,13 +62,14 @@ fn main() {
 
     let mut packed_qf: Vec<packed::PackedBlocks> = vec![];
 
-    let sample_block_num = CELESTIA_SAMPLE_SIZE / f.block_byte_size();
+    // let sample_block_num = CELESTIA_SAMPLE_SIZE / f.block_byte_size();
+    let sample_block_num = 1;
 
     let total_blocks = f.total_blocks().get() as u64;
-    for block_range_start in (0..10).step_by(sample_block_num) {
+    for block_range_start in (0..2).step_by(sample_block_num) {
         let block_range_end = (block_range_start + sample_block_num as u64).min(total_blocks);
 
-        let mut packed_runs: Vec<qfilter::Run> = vec![];
+        let mut packed_runs: Vec<run::Run> = vec![];
         let mut packed_blocks = packed::PackedBlocks::default();
         packed_blocks.block_offset = block_range_start;
         packed_blocks.blocks_num = (block_range_end - block_range_start) as u8;
@@ -81,8 +83,9 @@ fn main() {
             );
             println!("packed blocks: {:?}", packed_blocks);
             let mut buffer = String::new();
-            let mut runs = f.block_contains_runs(block_num);
+            let (mut runs, shifted) = f.block_contains_runs(block_num);
             let runs_idx: Vec<u64> = runs.iter().map(|run| run.q_bucket_idx).collect();
+            println!("runs idx: {:?}", runs_idx);
 
             packed_runs.append(&mut runs);
             let block = f.block(block_num);
@@ -98,19 +101,27 @@ fn main() {
                 block_num * 64,
                 block_num * 64 + 64,
             );
+
+            if block_num == block_range_end {
+                packed_blocks.shifted = shifted;
+            }
             packed_blocks.first_runstart_idx = runs_idx
                 .first()
-                .map(|&first_runstart_idx| packed_blocks.first_runstart_idx.min(first_runstart_idx))
-                .expect("error: first runstart ids");
+                .map(|&current_block_first_runstart_idx| {
+                    packed_blocks
+                        .first_runstart_idx
+                        .map(|first_runstart_idx| {
+                            current_block_first_runstart_idx.min(first_runstart_idx)
+                        })
+                        .unwrap_or(current_block_first_runstart_idx)
+                })
+                .or(packed_blocks.first_runstart_idx);
 
             packed_blocks.buffer.append(&mut block_bytes.to_vec());
             let from_packed_block = packed_blocks.raw_block(block_num);
             println!("offset: {}", from_packed_block.offset);
             println!("occupiends [{:b}]", from_packed_block.occupieds);
             println!("runends [{:b}]", from_packed_block.runends);
-            // io::stdin()
-            //     .read_line(&mut buffer)
-            //     .expect("Failed to read line");
 
             println!(
                 "________________________ block {} end --------------------",
@@ -126,7 +137,6 @@ fn main() {
             }
         }
 
-        println!("packed blocks contains {} items", contains_count);
         let run_spans: Vec<RunSpan> = packed_runs
             .iter()
             .filter_map(|run| {
@@ -145,13 +155,15 @@ fn main() {
         let count_buckets: u64 = run_spans
             .iter()
             .map(|run_span| {
+                println!("count bucket: [{}, {}]", run_span.start, run_span.end);
                 let buckets_num = run_span.end - run_span.start + 1;
-                // println!("buckets num: {}", buckets_num);
                 buckets_num
             })
             .sum();
         let count_runs = packed_runs.len();
         println!("count packed runs : {}", count_runs);
+
+        println!("packed blocks contains {} items", contains_count);
         println!("count packed runs bukcets: {}", count_buckets);
 
         // packed_runs.iter().for_each(|run| {

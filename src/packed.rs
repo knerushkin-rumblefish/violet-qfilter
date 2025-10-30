@@ -9,7 +9,7 @@ pub struct PackedBlocks {
     pub block_offset: u64,
     pub blocks_num: u8,
 
-    pub first_runstart_idx: u64,
+    pub first_runstart_idx: Option<u64>,
     //          block0 [
     //                   (run02 (s02N)],
     //                   [run01 (s011, s012, .., s011N)],
@@ -27,7 +27,7 @@ pub struct PackedBlocks {
     //                   (run22 (s22N)],
     //                   [run31 (s311, s312, .., s311N)],
     //                 ],
-    pub shifted: bool,
+    pub shifted: Option<u64>,
 }
 
 impl PackedBlocks {
@@ -184,7 +184,8 @@ impl PackedBlocks {
         // TODO: prev bucket id can be out of packed blocs scope
         let first_block_first_bucket_idx = self.block_offset * 64;
         if hash_bucket_idx == first_block_first_bucket_idx {
-            return self.first_runstart_idx;
+            // TODO: optional which is None only on initialization
+            return self.first_runstart_idx.unwrap();
         }
         // TODO: no restrictions on hash_bucket_idx but we're expect hash_bucket_idx to belong to
         // packed blocks slots
@@ -233,7 +234,11 @@ impl PackedBlocks {
         //          ^first_block_first_bucket_idx                          ^last_block_last_bucket_idx
         let first_block_first_bucket_idx = self.block_offset * 64;
         let last_block_last_bucket_idx =
-            first_block_first_bucket_idx + ((self.blocks_num as u64) * 64) - 1;
+            first_block_first_bucket_idx + ((self.blocks_num as u64) * 64);
+        println!(
+            "validate bucket idx: {} <= {} < {}",
+            first_block_first_bucket_idx, bucket_idx, last_block_last_bucket_idx
+        );
         bucket_idx >= first_block_first_bucket_idx && bucket_idx < last_block_last_bucket_idx
     }
 
@@ -268,6 +273,11 @@ impl PackedBlocks {
         );
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let hash_bucket_block_idx = hash_bucket_idx / 64;
+        println!(
+            "packed blocks: is_occupied hash_bukcet_block_idx {}",
+            hash_bucket_block_idx
+        );
+
         let hash_bucket_block_idx = self.normilize_block_num(hash_bucket_block_idx);
         println!(
             "packed blocks: is_occupied block_num {}",
@@ -293,11 +303,18 @@ impl PackedBlocks {
 
     #[inline(always)]
     pub fn get_remainder(&self, hash_bucket_idx: u64) -> u64 {
-        println!("packed blocks: get_remainder");
+        println!(
+            "packed blocks: get_remainder hash_bucket_idx {}",
+            hash_bucket_idx
+        );
         debug_assert!(self.rbits > 0 && self.rbits < 64);
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
 
         let hash_bucket_block_idx = hash_bucket_idx / 64;
+        println!(
+            "packed blocks: get_remainder hash_bucket_block_idx {}",
+            hash_bucket_block_idx
+        );
         let hash_bucket_block_idx = self.normilize_block_num(hash_bucket_block_idx);
 
         println!(
@@ -345,9 +362,17 @@ impl PackedBlocks {
             return false;
         }
 
+        // in this case we just ignore run which spans between packed blocks
+        // TODO: it should require extending this packed blocks with following packed blocks
         let mut runstart_idx = self.run_start(hash_bucket_idx);
 
         loop {
+            if let Some(shifted) = self.shifted {
+                if shifted <= runstart_idx {
+                    return false;
+                }
+            }
+
             println!("packed blocks contains: runstart_idx: {}", runstart_idx);
             let reminder = self.get_remainder(runstart_idx);
             println!("packed blocks contains: reminder: {}", reminder);
