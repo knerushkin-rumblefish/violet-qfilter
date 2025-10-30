@@ -79,14 +79,15 @@ impl Block {
 
         let hash_bucket_intrablock_offset = hash_bucket_idx % 64;
 
-        let raw_block = self.raw_block();
-        let hash_bucket_intrablock_rank =
-            raw_block.occupieds.popcnt(..=hash_bucket_intrablock_offset);
+        let current_block = self.raw_block();
+        let hash_bucket_intrablock_rank = current_block
+            .occupieds
+            .popcnt(..=hash_bucket_intrablock_offset);
         // No occupied buckets all the way to bucket_intrablock_offset
         // which also means hash_bucket_idx isn't occupied
         if hash_bucket_intrablock_rank == 0 {
             // TODO: WTF???
-            return if raw_block.offset <= hash_bucket_intrablock_offset {
+            return if current_block.offset <= hash_bucket_intrablock_offset {
                 // hash_bucket_idx points to an empty bucket unaffected by block offset,
                 // thus end == start
                 Some(hash_bucket_idx)
@@ -94,18 +95,18 @@ impl Block {
                 // hash_bucket_idx fall within the section occupied by the offset,
                 // thus end == last bucket of offset section
                 // TODO: WTF???
-                Some((hash_bucket_block_idx * 64 + raw_block.offset - 1) % self.total_buckets())
+                Some((hash_bucket_block_idx * 64 + current_block.offset - 1) % self.total_buckets())
             };
         }
 
         // Must search runends to figure out the end of the run
         // Is this block or next one?
         // if next we should follow to extension
-        let mut runend_block_idx = hash_bucket_block_idx + raw_block.offset / 64;
+        let mut runend_block_idx = hash_bucket_block_idx + current_block.offset / 64;
         assert_eq!(runend_block_idx, self.first_q_bucket_idx / 64);
 
-        let mut runend_ignore_bits = raw_block.offset % 64;
-        let mut runend_block = self.raw_block();
+        let mut runend_ignore_bits = current_block.offset % 64;
+        let mut runend_block = current_block;
         let mut runend_rank = hash_bucket_intrablock_rank - 1;
 
         let mut runend_block_offset = runend_block
@@ -118,17 +119,19 @@ impl Block {
         }
 
         loop {
-            runend_rank -= runend_block.runends.popcnt(runend_ignore_bits..);
-            runend_block_idx += 1;
-            runend_ignore_bits = 0;
-            runend_block = self.next.clone()?.raw_block();
-            runend_block_offset = runend_block
-                .runends
-                .select(runend_ignore_bits.., runend_rank);
+            if let Some(next_block) = self.next.clone() {
+                runend_rank -= runend_block.runends.popcnt(runend_ignore_bits..);
+                runend_block_idx += 1;
+                runend_ignore_bits = 0;
+                runend_block = next_block.raw_block();
+                runend_block_offset = runend_block
+                    .runends
+                    .select(runend_ignore_bits.., runend_rank);
 
-            if let Some(runend_block_offset) = runend_block_offset {
-                let runend_idx = runend_block_idx * 64 + runend_block_offset;
-                return Some(runend_idx.max(hash_bucket_idx) % self.total_buckets());
+                if let Some(runend_block_offset) = runend_block_offset {
+                    let runend_idx = runend_block_idx * 64 + runend_block_offset;
+                    return Some(runend_idx.max(hash_bucket_idx) % self.total_buckets());
+                }
             }
         }
     }
