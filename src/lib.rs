@@ -150,7 +150,7 @@ trait BitExt {
 }
 
 trait Membership {
-    fn contains<T: Hash>(&self, item: T) -> bool;
+    fn contains<T: Hash>(&self, item: T) -> Option<bool>;
 }
 
 impl BitExt for u64 {

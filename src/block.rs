@@ -1,6 +1,6 @@
-use crate::{BitExt, Block as BytesBlock, Filter, Membership};
+use crate::{BitExt, Block as BytesBlock, Membership, StableHasher};
 
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 
 const BLOCK_OFFSET_SIZE: usize = 1;
 const BLOCK_OCCUPIEDS_SIZE: usize = 8;
@@ -11,7 +11,7 @@ const BLOCK_REMINDERS_SLOTS_SIZE: usize = 64;
 #[derive(Default, Debug, Clone)]
 pub struct Block {
     pub first_q_bucket_idx: u64,
-    pub first_q_bucket_runstart_idx: Option<u64>,
+    pub first_q_bucket_runstart_offset: Option<u8>,
 
     pub buffer: Vec<u8>,
 
@@ -40,6 +40,13 @@ impl Block {
     #[inline]
     fn total_buckets(&self) -> u64 {
         1 << self.qbits
+    }
+
+    #[inline]
+    fn hash<T: Hash>(&self, item: T) -> u64 {
+        let mut hasher = StableHasher::new();
+        item.hash(&mut hasher);
+        hasher.finish()
     }
 
     // TODO: this is part of QF logic so should be in appropriate trait
@@ -141,11 +148,16 @@ impl Block {
 
     #[inline]
     fn run_start(&self, hash_bucket_idx: u64) -> Option<u64> {
-        assert!(self.contains_q_bucket_idx(hash_bucket_idx));
+        if !self.contains_q_bucket_idx(hash_bucket_idx) {
+            return None;
+        }
+
         // TODO: prev bucket id can be out of block scope
         if hash_bucket_idx == self.first_q_bucket_idx {
             // TODO: optional which is None only on initialization
-            return self.first_q_bucket_runstart_idx;
+            return self
+                .first_q_bucket_runstart_offset
+                .map(|runstart_offset| runstart_offset as u64 + self.first_q_bucket_idx);
         }
         // TODO: no restrictions on hash_bucket_idx but we're expect hash_bucket_idx to belong to
         // packed blocks slots
@@ -258,14 +270,15 @@ impl Block {
 }
 
 impl Membership for Block {
-    fn contains<T: Hash>(&self, _item: T) -> bool {
-        true
+    fn contains<T: Hash>(&self, item: T) -> Option<bool> {
+        self.contains_fingerprint(self.hash(item))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Filter;
     use rand::Rng;
 
     fn generate_filter(n: u64, slot_layout: &[u64]) -> (Filter, Vec<u64>, Vec<u64>) {
@@ -302,25 +315,19 @@ mod tests {
         (quotient, remainder)
     }
 
-    #[test]
-    fn single_block_no_next_run_ends() {
-        let buckets_layout = vec![55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 61, 62, 62, 64, 65];
+    fn extract_block(f: &Filter, n: u64, next: Option<Box<Block>>) -> Block {
+        let raw_block_bytes = f.block_bytes_with_r(n);
 
-        let expected_block_run_ends = vec![56, 56, 57, 59, 59, 60, 61];
-
-        let (f, _remainders, _) = generate_filter(100, &buckets_layout);
-
-        let next = None;
-
-        let count_blocks = f.blocks().count();
-        assert_eq!(count_blocks, 2);
-
-        let raw_block_bytes = f.block_bytes_with_r(0);
-        let runstart_idx = f.run_start(0);
+        let first_q_bucket_idx = n * 64;
+        let first_q_bucket_runstart_idx = f.run_start(first_q_bucket_idx);
 
         let block = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
+            first_q_bucket_idx,
+            first_q_bucket_runstart_offset: Some(
+                (first_q_bucket_runstart_idx - first_q_bucket_idx)
+                    .try_into()
+                    .unwrap(),
+            ),
 
             buffer: raw_block_bytes.to_vec(),
 
@@ -329,6 +336,19 @@ mod tests {
 
             next,
         };
+
+        return block;
+    }
+
+    #[test]
+    fn single_block_no_next_run_ends() {
+        let buckets_layout = vec![55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 61, 62, 62, 64, 65];
+
+        let expected_block_run_ends = vec![56, 56, 57, 59, 59, 60, 61];
+
+        let (f, _remainders, _) = generate_filter(100, &buckets_layout);
+
+        let block = extract_block(&f, 0, None);
 
         let mut actual_block_run_ends = vec![];
         for bucket_idx in buckets_layout {
@@ -351,45 +371,18 @@ mod tests {
         let (f, _remainders, _) = generate_filter(100, &buckets_layout);
         let expected_block_run_ends = vec![56, 56, 57, 59, 59, 60, 61, 64, 64, 64, 65, 67, 67, 68];
 
-        let block_start_bucket_idx = 64;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx / 64);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
+        let block_next = extract_block(&f, 1, None);
+        let next = Some(Box::new(block_next));
 
-        let block1 = Block {
-            first_q_bucket_idx: 64,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-            next: None,
-        };
-
-        let next = Some(Box::new(block1));
-
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_run_ends = vec![];
 
-        let block_bucket_range = block0.first_q_bucket_idx..block0.first_q_bucket_idx + 64;
+        let block_bucket_range = block.first_q_bucket_idx..block.first_q_bucket_idx + 64;
         for bucket_idx in buckets_layout {
             if block_bucket_range.contains(&bucket_idx) {
                 let f_run_end = f.run_end(bucket_idx);
-                if let Some(b_run_end) = block0.run_end(bucket_idx) {
+                if let Some(b_run_end) = block.run_end(bucket_idx) {
                     actual_block_run_ends.push(b_run_end);
                     assert_eq!(f_run_end, b_run_end);
                 }
@@ -409,31 +402,15 @@ mod tests {
 
         let next = None;
 
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_run_starts = vec![];
 
-        let block_bucket_range = block0.first_q_bucket_idx..block0.first_q_bucket_idx + 64;
         for bucket_idx in buckets_layout {
-            if block_bucket_range.contains(&bucket_idx) {
-                let f_run_start = f.run_start(bucket_idx);
-                if let Some(b_run_start) = block0.run_start(bucket_idx) {
-                    actual_block_run_starts.push(b_run_start);
-                    assert_eq!(f_run_start, b_run_start);
-                }
+            let f_run_start = f.run_start(bucket_idx);
+            if let Some(b_run_start) = block.run_start(bucket_idx) {
+                actual_block_run_starts.push(b_run_start);
+                assert_eq!(f_run_start, b_run_start);
             }
         }
 
@@ -448,48 +425,17 @@ mod tests {
 
         let (f, _remainders, _) = generate_filter(100, &buckets_layout);
 
-        let block_start_bucket_idx = 64;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx / 64);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
+        let block_next = extract_block(&f, 1, None);
+        let next = Some(Box::new(block_next));
 
-        let block1 = Block {
-            first_q_bucket_idx: 64,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-            next: None,
-        };
-
-        let next = Some(Box::new(block1));
-
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
-
+        let block = extract_block(&f, 0, next);
         let mut actual_block_run_starts = vec![];
 
-        let block_bucket_range = block0.first_q_bucket_idx..block0.first_q_bucket_idx + 64;
         for bucket_idx in buckets_layout {
-            if block_bucket_range.contains(&bucket_idx) {
-                let f_run_start = f.run_start(bucket_idx);
-                if let Some(b_run_start) = block0.run_start(bucket_idx) {
-                    actual_block_run_starts.push(b_run_start);
-                    assert_eq!(f_run_start, b_run_start);
-                }
+            let f_run_start = f.run_start(bucket_idx);
+            if let Some(b_run_start) = block.run_start(bucket_idx) {
+                actual_block_run_starts.push(b_run_start);
+                assert_eq!(f_run_start, b_run_start);
             }
         }
 
@@ -510,26 +456,13 @@ mod tests {
 
         let next = None;
 
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_remainders = vec![];
 
         for bucket_idx in buckets_layout {
             let f_remainder = f.get_remainder(bucket_idx);
-            if let Some(b_remainder) = block0.get_remainder(bucket_idx) {
+            if let Some(b_remainder) = block.get_remainder(bucket_idx) {
                 actual_block_remainders.push(b_remainder);
                 assert_eq!(f_remainder, b_remainder);
             }
@@ -550,45 +483,18 @@ mod tests {
             .filter(|&bucket_idx| bucket_idx < 64)
             .count()];
 
-        let block_start_bucket_idx = 64;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx / 64);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
+        let block_next = extract_block(&f, 1, None);
+        let next = Some(Box::new(block_next));
 
-        let block1 = Block {
-            first_q_bucket_idx: 64,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-            next: None,
-        };
-
-        let next = Some(Box::new(block1));
-
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_remainders = vec![];
 
         for bucket_idx in buckets_layout {
             let f_run_end = f.run_end(bucket_idx);
             let f_remainder = f.get_remainder(f_run_end);
-            if let Some(b_run_end) = block0.run_end(bucket_idx) {
-                if let Some(b_remainder) = block0.get_remainder(b_run_end) {
+            if let Some(b_run_end) = block.run_end(bucket_idx) {
+                if let Some(b_remainder) = block.get_remainder(b_run_end) {
                     actual_block_remainders.push(b_remainder);
                     assert_eq!(f_remainder, b_remainder);
                 }
@@ -634,45 +540,18 @@ mod tests {
         expected_block_remainders[9] = remainders[9];
         let expected_block_remainders = &expected_block_remainders[..expected_reminders_size];
 
-        let block_start_bucket_idx = 64;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx / 64);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
+        let block_next = extract_block(&f, 1, None);
+        let next = Some(Box::new(block_next));
 
-        let block1 = Block {
-            first_q_bucket_idx: 64,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-            next: None,
-        };
-
-        let next = Some(Box::new(block1));
-
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_remainders = vec![];
 
         for bucket_idx in buckets_layout {
             let f_run_end = f.run_end(bucket_idx);
             let f_remainder = f.get_remainder(f_run_end);
-            if let Some(b_run_end) = block0.run_end(bucket_idx) {
-                if let Some(b_remainder) = block0.get_remainder(b_run_end) {
+            if let Some(b_run_end) = block.run_end(bucket_idx) {
+                if let Some(b_remainder) = block.get_remainder(b_run_end) {
                     actual_block_remainders.push(b_remainder);
                     assert_eq!(f_remainder, b_remainder);
                 }
@@ -722,30 +601,17 @@ mod tests {
 
         let next = None;
 
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_block_remainders = vec![];
 
         for bucket_idx in buckets_layout {
             let f_run_end = f.run_end(bucket_idx);
             let f_remainder = f.get_remainder(f_run_end);
-            if let Some(b_run_end) = block0.run_end(bucket_idx) {
+            if let Some(b_run_end) = block.run_end(bucket_idx) {
                 assert_eq!(f_run_end, b_run_end);
 
-                if let Some(b_remainder) = block0.get_remainder(b_run_end) {
+                if let Some(b_remainder) = block.get_remainder(b_run_end) {
                     actual_block_remainders.push(b_remainder);
                     assert_eq!(f_remainder, b_remainder);
                 }
@@ -777,26 +643,13 @@ mod tests {
         collision_remainders.sort();
         let next = None;
 
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_contains_count = 0;
 
         for item in items {
             let f_result = f.contains_fingerprint(item);
-            if let Some(b_result) = block0.contains_fingerprint(item) {
+            if let Some(b_result) = block.contains_fingerprint(item) {
                 actual_contains_count += 1;
                 assert_eq!(f_result, b_result);
             }
@@ -809,45 +662,19 @@ mod tests {
     fn multiple_blocks_with_next_contains() {
         let buckets_layout = vec![55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 61, 62, 62, 64, 65];
 
-        let (f, remainders, items) = generate_filter(100, &buckets_layout);
-        let block_start_bucket_idx = 64;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx / 64);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
+        let (f, _remainders, items) = generate_filter(100, &buckets_layout);
 
-        let block1 = Block {
-            first_q_bucket_idx: 64,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
+        let block_next = extract_block(&f, 1, None);
+        let next = Some(Box::new(block_next));
 
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-            next: None,
-        };
-
-        let next = Some(Box::new(block1));
-
-        let block_start_bucket_idx = 0;
-        let raw_block_bytes = f.block_bytes_with_r(block_start_bucket_idx);
-        let runstart_idx = f.run_start(block_start_bucket_idx);
-        let block0 = Block {
-            first_q_bucket_idx: 0,
-            first_q_bucket_runstart_idx: Some(runstart_idx),
-
-            buffer: raw_block_bytes.to_vec(),
-
-            rbits: f.rbits.get() as u8,
-            qbits: f.qbits.get() as u8,
-
-            next,
-        };
+        let block = extract_block(&f, 0, next);
 
         let mut actual_contains_count = 0;
         let mut actual_contained_items = vec![];
 
         for &item in &items {
             let f_result = f.contains_fingerprint(item);
-            if let Some(b_result) = block0.contains_fingerprint(item) {
+            if let Some(b_result) = block.contains_fingerprint(item) {
                 actual_contains_count += 1;
                 actual_contained_items.push(item);
                 assert_eq!(f_result, b_result);
