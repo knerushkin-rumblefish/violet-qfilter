@@ -1,4 +1,4 @@
-use crate::{BitExt, Block as BytesBlock, Membership, StableHasher};
+use crate::{BitExt, Block as BytesBlock, Filter, Membership, StableHasher};
 
 use std::hash::{Hash, Hasher};
 
@@ -267,6 +267,127 @@ impl Block {
     pub fn contains_q_bucket_idx(&self, q_bucket_idx: u64) -> bool {
         q_bucket_idx >= self.first_q_bucket_idx && q_bucket_idx < self.first_q_bucket_idx + 64
     }
+
+    pub fn extract_block_by_fingerprint(filter: &Filter, hash: u64) -> Block {
+        let (hash_bucket_idx, _hash_remainder) = filter.calc_qr(hash);
+
+        let hash_bucket_idx = hash_bucket_idx % filter.total_buckets();
+        let hash_bucket_block_num = hash_bucket_idx / 64;
+        let hash_bucket_block_idx = (hash_bucket_block_num * 64) % filter.total_buckets();
+
+        let raw_block_bytes = filter.block_bytes_with_r(hash_bucket_block_num);
+
+        let hash_bucket_runstart_idx = filter.run_start(hash_bucket_idx);
+        let hash_bucket_runend_idx = filter.run_end(hash_bucket_idx);
+
+        // TODO: case when first bucket is already not in the current block
+        let first_bucket_runstart_idx = filter.run_start(hash_bucket_block_idx);
+
+        let mut next_block: Option<Box<Block>> = None;
+        let next_block_bucket_idx = (hash_bucket_block_idx + 64) % filter.total_buckets();
+
+        // TODO: run shifted more than to the next block
+        if hash_bucket_runend_idx >= next_block_bucket_idx
+            || hash_bucket_runstart_idx >= next_block_bucket_idx
+            || first_bucket_runstart_idx > next_block_bucket_idx
+        {
+            let next_block_first_bucket_runstart_idx = filter.run_start(next_block_bucket_idx);
+            let raw_block_bytes = filter.block_bytes_with_r(next_block_bucket_idx / 64);
+            next_block = Some(Box::new(Block {
+                first_q_bucket_idx: next_block_bucket_idx,
+                first_q_bucket_runstart_offset: Some(
+                    (next_block_first_bucket_runstart_idx - next_block_bucket_idx)
+                        .try_into()
+                        .unwrap(),
+                ),
+
+                buffer: raw_block_bytes.to_vec(),
+
+                rbits: filter.rbits.get() as u8,
+                qbits: filter.qbits.get() as u8,
+
+                // TODO: should link all following block's on which current run is spanned
+                next: None,
+            }))
+        }
+
+        Block {
+            first_q_bucket_idx: hash_bucket_block_idx,
+            first_q_bucket_runstart_offset: Some(
+                (first_bucket_runstart_idx - hash_bucket_block_idx)
+                    .try_into()
+                    .unwrap(),
+            ),
+
+            buffer: raw_block_bytes.to_vec(),
+
+            rbits: filter.rbits.get() as u8,
+            qbits: filter.qbits.get() as u8,
+
+            // TODO: should link all following block's on which current run is spanned
+            next: next_block,
+        }
+    }
+
+    pub fn runs(&self) -> RunIter<'_> {
+        RunIter::new(self)
+    }
+}
+
+pub struct RunIter<'a> {
+    block: &'a Block,
+    q_bucket_idx: u64,
+    r_bucket_idx: u64,
+    remaining: u64,
+}
+
+impl<'a> RunIter<'a> {
+    pub fn new(block: &'a Block) -> Self {
+        let mut iter = RunIter {
+            block,
+            q_bucket_idx: 0,
+            r_bucket_idx: 0,
+            remaining: 64,
+        };
+
+        while let Some(false) = block.is_occupied(iter.q_bucket_idx) {
+            iter.q_bucket_idx += 1;
+        }
+        if let Some(run_start) = block.run_start(iter.q_bucket_idx) {
+            iter.r_bucket_idx = run_start;
+        }
+
+        iter
+    }
+}
+
+impl<'a> Iterator for RunIter<'a> {
+    type Item = (u64, u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(r) = self.remaining.checked_sub(1) {
+            self.remaining = r;
+        } else {
+            return None;
+        }
+
+        let run_start_idx = self.block.run_start(self.q_bucket_idx)?;
+        let run_end_idx = self.block.run_end(self.q_bucket_idx)?;
+
+        let run = (self.q_bucket_idx, run_start_idx, run_end_idx);
+
+        if self.block.is_runend(self.r_bucket_idx)? {
+            self.q_bucket_idx += 1;
+            while let Some(false) = self.block.is_occupied(self.q_bucket_idx) {
+                self.q_bucket_idx += 1;
+            }
+            self.r_bucket_idx = (self.r_bucket_idx + 1).max(self.q_bucket_idx);
+        } else {
+            self.r_bucket_idx += 1;
+        }
+
+        Some(run)
+    }
 }
 
 impl Membership for Block {
@@ -279,7 +400,7 @@ impl Membership for Block {
 mod tests {
     use super::*;
     use crate::Filter;
-    use rand::Rng;
+    use rand::{seq::IndexedRandom, Rng};
 
     fn generate_filter(n: u64, slot_layout: &[u64]) -> (Filter, Vec<u64>, Vec<u64>) {
         let mut f = Filter::new(n, 0.01).unwrap();
@@ -291,7 +412,7 @@ mod tests {
         let qbits = f.qbits.get() as u8;
 
         let mut remainders: Vec<u64> = vec![];
-        let mut items: Vec<u64> = vec![];
+        let mut fingerprints: Vec<u64> = vec![];
 
         for &slot in slot_layout.iter() {
             let (mut quotient, mut remainder) = generate_item(slot, qbits, rbits);
@@ -299,12 +420,12 @@ mod tests {
                 (quotient, remainder) = generate_item(slot, qbits, rbits);
             }
             remainders.push(remainder);
-            items.push(quotient | remainder);
+            fingerprints.push(quotient | remainder);
             // TODO: handle collision. currently expecting remainder to be unique
             f.insert_raw_counting(1, quotient | remainder).unwrap();
         }
 
-        (f, remainders, items)
+        (f, remainders, fingerprints)
     }
 
     fn generate_item(q_bucket_idx: u64, _qbits: u8, rbits: u8) -> (u64, u64) {
@@ -637,7 +758,7 @@ mod tests {
 
         let run_ends = [57, 59, 59, 60, 61, 62, 63];
 
-        let (f, remainders, items) = generate_filter(100, &buckets_layout);
+        let (f, remainders, fingerprints) = generate_filter(100, &buckets_layout);
 
         let mut collision_remainders = [remainders[1], remainders[2]];
         collision_remainders.sort();
@@ -647,9 +768,9 @@ mod tests {
 
         let mut actual_contains_count = 0;
 
-        for item in items {
-            let f_result = f.contains_fingerprint(item);
-            if let Some(b_result) = block.contains_fingerprint(item) {
+        for fingerprint in fingerprints {
+            let f_result = f.contains_fingerprint(fingerprint);
+            if let Some(b_result) = block.contains_fingerprint(fingerprint) {
                 actual_contains_count += 1;
                 assert_eq!(f_result, b_result);
             }
@@ -662,7 +783,7 @@ mod tests {
     fn multiple_blocks_with_next_contains() {
         let buckets_layout = vec![55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 61, 62, 62, 64, 65];
 
-        let (f, _remainders, items) = generate_filter(100, &buckets_layout);
+        let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
 
         let block_next = extract_block(&f, 1, None);
         let next = Some(Box::new(block_next));
@@ -670,13 +791,11 @@ mod tests {
         let block = extract_block(&f, 0, next);
 
         let mut actual_contains_count = 0;
-        let mut actual_contained_items = vec![];
 
-        for &item in &items {
-            let f_result = f.contains_fingerprint(item);
-            if let Some(b_result) = block.contains_fingerprint(item) {
+        for &fingerprint in &fingerprints {
+            let f_result = f.contains_fingerprint(fingerprint);
+            if let Some(b_result) = block.contains_fingerprint(fingerprint) {
                 actual_contains_count += 1;
-                actual_contained_items.push(item);
                 assert_eq!(f_result, b_result);
             }
         }
@@ -688,5 +807,28 @@ mod tests {
                 .filter(|&bucket_idx| *bucket_idx < 64)
                 .count()
         );
+    }
+
+    #[test]
+    fn extract_by_fingerprint() {
+        let buckets_layout = vec![
+            55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 61, 62, 62, 64, 65, 127, 127,
+        ];
+
+        let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
+
+        let mut items_contains = 0;
+        for (&bucket, &fingerprint) in buckets_layout.iter().zip(fingerprints.iter()) {
+            let block = Block::extract_block_by_fingerprint(&f, fingerprint);
+
+            let f_result = f.contains_fingerprint(fingerprint);
+            // TODO: withou next block assertion doesnt even happens
+            if let Some(b_result) = block.contains_fingerprint(fingerprint) {
+                items_contains += 1;
+                assert_eq!(f_result, b_result);
+            }
+        }
+
+        assert_eq!(fingerprints.len(), items_contains);
     }
 }

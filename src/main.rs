@@ -1,11 +1,7 @@
 use qfilter::merkle;
 use qfilter::{packed, run};
 
-use std::io;
-
-use itertools::Itertools;
-use rand::{rand_core::block, rng, Rng};
-use std::hash::Hash;
+use rand::{rng, Rng};
 
 const CELESTIA_SAMPLE_SIZE: usize = 482;
 
