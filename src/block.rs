@@ -817,18 +817,17 @@ mod tests {
 
         let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
 
-        let mut items_contains = 0;
+        let mut fingerprints_count = 0;
         for &fingerprint in fingerprints.iter() {
             let block = Block::extract_block_by_fingerprint(&f, fingerprint);
 
             let f_result = f.contains_fingerprint(fingerprint);
-            // TODO: withou next block assertion doesnt even happens
             if let Some(b_result) = block.contains_fingerprint(fingerprint) {
-                items_contains += 1;
+                fingerprints_count += 1;
                 assert_eq!(f_result, b_result);
             }
         }
 
-        assert_eq!(fingerprints.len(), items_contains);
+        assert_eq!(fingerprints.len(), fingerprints_count);
     }
 }
