@@ -818,7 +818,7 @@ mod tests {
         let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
 
         let mut items_contains = 0;
-        for (&bucket, &fingerprint) in buckets_layout.iter().zip(fingerprints.iter()) {
+        for &fingerprint in fingerprints.iter() {
             let block = Block::extract_block_by_fingerprint(&f, fingerprint);
 
             let f_result = f.contains_fingerprint(fingerprint);
