@@ -28,6 +28,7 @@ rand = "0.9.2"
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 mem_dbg = "0.3.0"
 itertools = "0.14.0"
+bincode = "2.0.1"
 
 
 [dev-dependencies]

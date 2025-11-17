@@ -1,4 +1,6 @@
 use crate::{BitExt, Block as BytesBlock, Filter, Membership, StableHasher};
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use std::hash::{Hash, Hasher};
 
@@ -8,10 +10,9 @@ const BLOCK_RUNENDS_SIZE: usize = 8;
 
 const BLOCK_REMINDERS_SLOTS_SIZE: usize = 64;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Encode, Decode, Serialize, Deserialize)]
 pub struct Block {
     pub first_q_bucket_idx: u64,
-    pub first_q_bucket_runstart_offset: Option<u8>,
 
     pub buffer: Vec<u8>,
 
@@ -21,10 +22,22 @@ pub struct Block {
     pub next: Option<Box<Block>>,
 }
 
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct RawBlock {
+    pub buffer: Vec<u8>,
+
+    pub rbits: u8,
+    pub qbits: u8,
+}
+
 impl Block {
     #[inline]
     fn block_header_size(&self) -> usize {
         BLOCK_OFFSET_SIZE + BLOCK_OCCUPIEDS_SIZE + BLOCK_RUNENDS_SIZE
+    }
+
+    pub fn block_num(&self) -> u64 {
+        (self.first_q_bucket_idx % self.total_buckets()) / 64
     }
 
     #[inline]
@@ -35,6 +48,11 @@ impl Block {
     #[inline]
     fn block_bytes(&self) -> &[u8] {
         &self.buffer[..self.block_header_size()]
+    }
+
+    #[inline]
+    fn block_offset(&self) -> u64 {
+        self.buffer[0] as u64
     }
 
     #[inline]
@@ -155,9 +173,7 @@ impl Block {
         // TODO: prev bucket id can be out of block scope
         if hash_bucket_idx == self.first_q_bucket_idx {
             // TODO: optional which is None only on initialization
-            return self
-                .first_q_bucket_runstart_offset
-                .map(|runstart_offset| runstart_offset as u64 + self.first_q_bucket_idx);
+            return Some(self.block_offset() + self.first_q_bucket_idx);
         }
         // TODO: no restrictions on hash_bucket_idx but we're expect hash_bucket_idx to belong to
         // packed blocks slots
@@ -247,7 +263,7 @@ impl Block {
         }
 
         if !self.is_occupied(hash_bucket_idx)? {
-            return None;
+            return Some(false);
         }
 
         let mut runstart_idx = self.run_start(hash_bucket_idx)?;
@@ -295,12 +311,6 @@ impl Block {
             let raw_block_bytes = filter.block_bytes_with_r(next_block_bucket_idx / 64);
             next_block = Some(Box::new(Block {
                 first_q_bucket_idx: next_block_bucket_idx,
-                first_q_bucket_runstart_offset: Some(
-                    (next_block_first_bucket_runstart_idx - next_block_bucket_idx)
-                        .try_into()
-                        .unwrap(),
-                ),
-
                 buffer: raw_block_bytes.to_vec(),
 
                 rbits: filter.rbits.get() as u8,
@@ -313,11 +323,6 @@ impl Block {
 
         Block {
             first_q_bucket_idx: hash_bucket_block_idx,
-            first_q_bucket_runstart_offset: Some(
-                (first_bucket_runstart_idx - hash_bucket_block_idx)
-                    .try_into()
-                    .unwrap(),
-            ),
 
             buffer: raw_block_bytes.to_vec(),
 
@@ -361,8 +366,18 @@ impl<'a> RunIter<'a> {
     }
 }
 
-impl<'a> Iterator for RunIter<'a> {
-    type Item = (u64, u64, u64);
+#[derive(Debug)]
+pub struct Run<'block> {
+    block: &'block Block,
+
+    q_bucket_idx: u64,
+
+    runend_idx: u64,
+    runstart_idx: u64,
+}
+
+impl<'block> Iterator for RunIter<'block> {
+    type Item = Run<'block>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(r) = self.remaining.checked_sub(1) {
@@ -371,22 +386,65 @@ impl<'a> Iterator for RunIter<'a> {
             return None;
         }
 
-        let run_start_idx = self.block.run_start(self.q_bucket_idx)?;
-        let run_end_idx = self.block.run_end(self.q_bucket_idx)?;
+        let runstart_idx = self.block.run_start(self.q_bucket_idx)?;
+        let runend_idx = self.block.run_end(self.q_bucket_idx)?;
 
-        let run = (self.q_bucket_idx, run_start_idx, run_end_idx);
+        let run = Run {
+            block: self.block,
+            q_bucket_idx: self.q_bucket_idx,
+            runstart_idx,
+            runend_idx,
+        };
 
-        if self.block.is_runend(self.r_bucket_idx)? {
+        self.q_bucket_idx += 1;
+        while let Some(false) = self.block.is_occupied(self.q_bucket_idx) {
             self.q_bucket_idx += 1;
-            while let Some(false) = self.block.is_occupied(self.q_bucket_idx) {
-                self.q_bucket_idx += 1;
-            }
-            self.r_bucket_idx = (self.r_bucket_idx + 1).max(self.q_bucket_idx);
-        } else {
-            self.r_bucket_idx += 1;
         }
 
         Some(run)
+    }
+}
+
+impl<'block> Run<'block> {
+    pub fn fingerprints(&self) -> FingerprintIter<'_, 'block> {
+        FingerprintIter::new(self)
+    }
+}
+
+pub struct FingerprintIter<'run, 'block> {
+    run: &'run Run<'block>,
+    r_bucket_idx: u64,
+    remaining: u64,
+}
+
+impl<'run, 'block> FingerprintIter<'run, 'block> {
+    fn new(run: &'run Run<'block>) -> Self {
+        let remaining = run.runend_idx - run.runstart_idx + 1;
+
+        FingerprintIter {
+            run,
+            remaining,
+            r_bucket_idx: run.runstart_idx,
+        }
+    }
+}
+
+impl Iterator for FingerprintIter<'_, '_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(r) = self.remaining.checked_sub(1) {
+            self.remaining = r;
+        } else {
+            return None;
+        }
+
+        let hash = (self.run.q_bucket_idx << self.run.block.rbits)
+            | self.run.block.get_remainder(self.r_bucket_idx)?;
+
+        self.r_bucket_idx += 1;
+
+        Some(hash)
     }
 }
 
@@ -444,11 +502,6 @@ mod tests {
 
         let block = Block {
             first_q_bucket_idx,
-            first_q_bucket_runstart_offset: Some(
-                (first_q_bucket_runstart_idx - first_q_bucket_idx)
-                    .try_into()
-                    .unwrap(),
-            ),
 
             buffer: raw_block_bytes.to_vec(),
 
@@ -829,5 +882,104 @@ mod tests {
         }
 
         assert_eq!(fingerprints.len(), fingerprints_count);
+    }
+
+    #[test]
+    fn iterate_over_block_runs() {
+        let buckets_layout = vec![
+            /*                              run
+                                       |---------------|
+             0   1   2   3   4   5   6 | 7   8|  9  10 |11  12  13  14  15   16  17
+            55  56  57  58  59  60  61 |62  63| 64  65 |66  67  68  69  70   71  72
+            ------------ block ---------------|
+            ------------ block runs ------------------------------|
+            */
+            55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 60, 61, 62, 62, 64, 65, 127, 127,
+        ];
+
+        let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
+
+        let q_bucket = 60;
+
+        let mut expected_block_run_fingerprints: Vec<u64> = buckets_layout
+            .iter()
+            .enumerate()
+            .filter(|(_, &bucket_idx)| bucket_idx < 64)
+            .filter_map(|(n, _)| fingerprints.get(n))
+            .copied()
+            .collect();
+
+        let r_bucket_index = buckets_layout
+            .iter()
+            .position(|&x| x == q_bucket)
+            .expect("r bucket not found");
+
+        let fingerprint = fingerprints
+            .get(r_bucket_index)
+            .expect("fingerprint not found");
+
+        let block = Block::extract_block_by_fingerprint(&f, *fingerprint);
+
+        let mut block_run_fingerprints: Vec<u64> = block
+            .runs()
+            .flat_map(|run| {
+                let r_fingerprints: Vec<u64> = run.fingerprints().collect();
+                r_fingerprints
+            })
+            .collect();
+
+        expected_block_run_fingerprints.sort();
+        block_run_fingerprints.sort();
+
+        assert_eq!(expected_block_run_fingerprints, block_run_fingerprints);
+    }
+
+    #[test]
+    fn iterate_over_block_run_span_multi_blocks_fingeprints() {
+        let buckets_layout = vec![
+            /*                              run
+                                       |---------------|
+             0   1   2   3   4   5   6 | 7   8|  9  10 |11  12  13  14  15   16  17
+            55  56  57  58  59  60  61 |62  63| 64  65 |66  67  68  69  70   71  72
+            ------------ block q buckets -----|
+            ------------ block r buckets -------------------------|
+            */
+            55, 55, 56, 57, 57, 58, 59, 60, 60, 60, 60, 61, 62, 62, 64, 65, 127, 127,
+        ];
+
+        let (f, _remainders, fingerprints) = generate_filter(100, &buckets_layout);
+
+        let q_bucket = 60;
+
+        let mut expected_run_fingerprints: Vec<u64> = buckets_layout
+            .iter()
+            .enumerate()
+            .filter(|(_, &bucket_idx)| bucket_idx == q_bucket)
+            .filter_map(|(n, _)| fingerprints.get(n))
+            .copied()
+            .collect();
+
+        let r_bucket_index = buckets_layout
+            .iter()
+            .position(|&x| x == q_bucket)
+            .expect("r bucket not found");
+
+        let fingerprint = fingerprints
+            .get(r_bucket_index)
+            .expect("fingerprint not found");
+
+        let block = Block::extract_block_by_fingerprint(&f, *fingerprint);
+
+        let run: Run = block
+            .runs()
+            .find(|run| run.q_bucket_idx == q_bucket)
+            .expect("no able to get run for q bucket");
+
+        let mut run_fingerprints: Vec<u64> = run.fingerprints().collect();
+
+        run_fingerprints.sort();
+        expected_run_fingerprints.sort();
+
+        assert_eq!(run_fingerprints, expected_run_fingerprints);
     }
 }

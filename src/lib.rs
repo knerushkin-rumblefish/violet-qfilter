@@ -89,15 +89,15 @@ mod stable_hasher;
 #[derive(Clone, MemSize, Archive, Deserialize, Serialize, PartialEq)]
 #[repr(C)]
 pub struct Filter {
-    buffer: Vec<u8>,
+    pub buffer: Vec<u8>,
 
-    len: u64,
+    pub len: u64,
 
     pub qbits: NonZeroU8,
 
     pub rbits: NonZeroU8,
 
-    max_qbits: Option<NonZeroU8>,
+    pub max_qbits: Option<NonZeroU8>,
 }
 
 #[derive(Debug)]
@@ -322,7 +322,7 @@ impl CastNonZeroU8 for NonZeroU8 {
         self.get() as usize
     }
 }
-struct BlockIter<'a> {
+pub struct BlockIter<'a> {
     filter: &'a Filter,
     current_block: u64,
 }
@@ -1710,7 +1710,7 @@ impl Filter {
     }
 
     #[inline]
-    fn hash<T: Hash>(&self, item: T) -> u64 {
+    pub fn hash<T: Hash>(&self, item: T) -> u64 {
         let mut hasher = StableHasher::new();
         item.hash(&mut hasher);
         hasher.finish()
