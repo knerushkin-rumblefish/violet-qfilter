@@ -13,6 +13,7 @@ exclude = ["fuzz", "benches"]
 
 [features]
 default = ["serde"]
+ddos_limit = []
 # Enable to support running on x64 cpus released before 2008
 legacy_x86_64_support = []
 jsonschema = ["schemars"]
@@ -44,3 +45,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
+

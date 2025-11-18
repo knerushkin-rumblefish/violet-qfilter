@@ -334,6 +334,71 @@ impl Block {
         }
     }
 
+    pub fn extract_blocks_by_fingerprint(filter: &Filter, hash: u64) -> Vec<Block> {
+        let (hash_bucket_idx, _hash_remainder) = filter.calc_qr(hash);
+
+        let hash_bucket_idx = hash_bucket_idx % filter.total_buckets();
+        let hash_bucket_block_num = hash_bucket_idx / 64;
+        let hash_bucket_block_idx = (hash_bucket_block_num * 64) % filter.total_buckets();
+
+        let raw_block_bytes = filter.block_bytes_with_r(hash_bucket_block_num);
+
+        let hash_bucket_runstart_idx = filter.run_start(hash_bucket_idx);
+        let hash_bucket_runend_idx = filter.run_end(hash_bucket_idx);
+
+        // TODO: case when first bucket is already not in the current block
+        let first_bucket_runstart_idx = filter.run_start(hash_bucket_block_idx);
+
+        let mut next_block: Option<Box<Block>> = None;
+        let next_block_bucket_idx = (hash_bucket_block_idx + 64) % filter.total_buckets();
+
+        // TODO: run shifted more than to the next block
+        if hash_bucket_runend_idx >= next_block_bucket_idx
+            || hash_bucket_runstart_idx >= next_block_bucket_idx
+            || first_bucket_runstart_idx > next_block_bucket_idx
+        {
+            let raw_block_bytes = filter.block_bytes_with_r(next_block_bucket_idx / 64);
+            next_block = Some(Box::new(Block {
+                first_q_bucket_idx: next_block_bucket_idx,
+                buffer: raw_block_bytes.to_vec(),
+
+                rbits: filter.rbits.get() as u8,
+                qbits: filter.qbits.get() as u8,
+
+                // TODO: should link all following block's on which current run is spanned
+                next: None,
+            }))
+        }
+
+        match next_block {
+            Some(next_block) => vec![
+                Block {
+                    first_q_bucket_idx: hash_bucket_block_idx,
+
+                    buffer: raw_block_bytes.to_vec(),
+
+                    rbits: filter.rbits.get() as u8,
+                    qbits: filter.qbits.get() as u8,
+
+                    // TODO: should link all following block's on which current run is spanned
+                    next: Some(next_block.clone()),
+                },
+                *next_block,
+            ],
+            None => vec![Block {
+                first_q_bucket_idx: hash_bucket_block_idx,
+
+                buffer: raw_block_bytes.to_vec(),
+
+                rbits: filter.rbits.get() as u8,
+                qbits: filter.qbits.get() as u8,
+
+                // TODO: should link all following block's on which current run is spanned
+                next: None,
+            }],
+        }
+    }
+
     pub fn runs(&self) -> RunIter<'_> {
         RunIter::new(self)
     }

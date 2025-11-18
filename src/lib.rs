@@ -1613,6 +1613,9 @@ impl Filter {
             Operation::BeforeRunend => { /* there are larger remainders already in the run. */ }
         }
 
+        if cfg!(feature = "ddos_limit") && (runstart_idx + 8 < empty_slot_idx) {
+            panic!("run contains too many fingerprints");
+        }
         self.inc_offsets(hash_bucket_idx, empty_slot_idx);
         self.len += 1;
         Ok(fingerprint_count)
